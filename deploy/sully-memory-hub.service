@@ -1,0 +1,21 @@
+[Unit]
+Description=SullyOS Memory Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sully-memory-hub
+EnvironmentFile=/opt/sully-memory-hub/.env
+ExecStart=/usr/bin/node /opt/sully-memory-hub/server.mjs
+Restart=on-failure
+RestartSec=5
+User=sully
+Group=sully
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/sully-memory-hub
+
+[Install]
+WantedBy=multi-user.target
