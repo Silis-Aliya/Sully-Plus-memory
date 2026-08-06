@@ -1,6 +1,6 @@
 # SullyOS Memory Hub VPS Deploy
 
-Memory Hub is the VPS authority and bridge shared by SullyOS and Claude Code. SullyOS uses HTTPS and Outbox; Claude Code uses the HTTP-backed MCP server. Ombre export remains an optional legacy integration and is not part of the required production message path.
+Memory Hub is the VPS authority and bridge shared by SullyOS and Claude Code. SullyOS uses HTTPS and Outbox; Claude Code uses the HTTP-backed MCP server.
 
 ```text
 phone / browser / SullyOS
@@ -137,46 +137,6 @@ The target display contract is:
 - `EventBox` -> 事件盒 page
 - `Anticipation` -> 窗台期盼 page
 - `DigestReport` -> 认知消化 page
-
-## Optional Legacy Ombre Bridge Contract
-
-This section is retained only for backward compatibility. The target SullyOS ↔ Hub ↔ CC architecture does not require Ombre and does not route CC activity through a second chat model.
-
-Memory Hub posts pending memories to:
-
-```text
-POST {OMBRE_SULLY_BRIDGE_URL}/api/sully/memories
-```
-
-If `OMBRE_SULLY_BRIDGE_URL` already ends with `/api/sully`, Hub appends `/memories`.
-
-Headers:
-
-```text
-Content-Type: application/json
-X-Sully-Bridge-Key: <OMBRE_SULLY_BRIDGE_KEY>
-```
-
-Payload uses Ombre's Sully bridge fields:
-
-```json
-{
-  "sullyNodeId": "node-id",
-  "charId": "sully",
-  "charName": "Sully",
-  "groupId": "",
-  "room": "living_room",
-  "visibility": "private",
-  "scope": "memory_palace",
-  "source": "sullyos_memory_palace",
-  "content": "memory content",
-  "title": "title",
-  "tags": ["tag"],
-  "importance": 7,
-  "mood": "feel label",
-  "type": "dynamic"
-}
-```
 
 ## Nginx
 

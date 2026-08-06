@@ -40,7 +40,6 @@ SullyOS Memory Hub 是 SullyOS 的独立外置记忆库和后置认知设备。
 
 - 复制 SullyOS 的聊天界面和游戏功能
 - 擅自改写 SullyOS 原版 prompt 或七房间语义
-- 用 Ombre 的记忆语义替换 SullyOS 的 Memory Palace 语义
 - 自动硬删除“遗忘”的记忆
 
 ## 目标架构
@@ -90,22 +89,6 @@ flowchart LR
 | 聊天前使用 Hub 召回 | 未完成 | SullyOS 当前仍主要调用本地 `injectMemoryPalace` |
 | Hub 写回 SullyOS | 部分完成 | Hub Outbox 已完成；还缺 SullyOS 侧拉取、渲染、ACK 与真实设备联调 |
 
-## SullyOS、Hub 与 Ombre Brain 的差异
-
-| 维度 | SullyOS | Memory Hub | Ombre Brain |
-| --- | --- | --- | --- |
-| 核心定位 | 角色聊天和完整前台产品 | SullyOS 兼容的独立外置记忆运行时 | 通用长期记忆/脑状态架构参考 |
-| 权威语义 | Memory Palace、Legacy、角色认知 | 原版模式严格对齐 SullyOS，并允许显式增强 | bucket、索引、激活、生命力和维护 |
-| 数据入口 | 本地聊天和角色状态 | API、导入、SullyOS 同步、CC | 通常由上层应用喂入 |
-| 房间 | 七房间固定语义 | 七房间逐字对齐 | 不以 SullyOS 七房间为核心 |
-| 事件聚合 | EventBox | 原版兼容 + 可切换增强展开 | 可作为聚合和索引参考 |
-| 长期认知 | 印象、self insight、人格、月度记忆 | 独立生成、保存、召回和管理 | 更侧重通用脑状态和记忆维护 |
-| 召回 | SullyOS 本地 formatter | 等价 formatter + 完整审计 + rerank | 语义检索、激活和 Breath 思路 |
-| 遗忘 | 房间衰减、容量、降级到 attic、摘要吸收 | 已搬运 SullyOS consolidation；另有只读 vitality | 半衰期、激活次数和生命力更突出 |
-| UI | SullyOS 内部页面 | 专用记忆管理后台 | 不是 Hub 必须复制的界面 |
-
-Ombre Brain 对 Hub 的价值主要是工程增强：Breath、生命力、向量索引、维护视图和外部脑部署。所有这些增强必须与 SullyOS 原始语义分层，不能悄悄改变原版召回结果。
-
 ## 记忆处理主干
 
 ```text
@@ -153,7 +136,7 @@ Breath 有两类用途，不能混为一谈：
 - **搜索召回**：调用完整 `/api/recall`，用于聊天或模型请求前的真实记忆读取。
 - **探索与管理**：自动浮现、目录、高重要度、Feel 通道，用于浏览和维护记忆，不等于 SullyOS formatter 的最终上下文。
 
-Ombre 风格 vitality 综合 importance、年龄、最近激活、激活次数和 pinned 状态，显示 active、stable、dormant、cold、core。它目前用于排序和观察，不直接修改 SullyOS 的房间、importance 或删除数据。
+只读 vitality 综合 importance、年龄、最近激活、激活次数和 pinned 状态，显示 active、stable、dormant、cold、core。它目前用于排序和观察，不直接修改 SullyOS 的房间、importance 或删除数据。
 
 ## 遗忘与 Consolidation
 
