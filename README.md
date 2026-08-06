@@ -465,6 +465,7 @@ npm run test:runtime
 
 ## 相关文档
 
+- `SULLY_CONTEXT_COVERAGE_AUDIT.md`：当前 SullyOS → Hub Prompt/Context 覆盖矩阵、交叉哈希与 CC 部署阻塞项
 - `ARCHITECTURE_PRINCIPLES.md`：不可破坏的架构原则
 - `MEMORY_PALACE_PROMPT_PORTING_FOR_CODEX.md`：Memory Palace prompt 搬运范围和约束
 - `README_QUICKSTART.md`：快速启动

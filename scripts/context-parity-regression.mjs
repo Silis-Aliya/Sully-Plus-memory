@@ -7,6 +7,11 @@ const hash = (value) => createHash("sha256").update(typeof value === "string" ? 
 const goldenCases = [
   {
     name: "context-parity-p0",
+    sourceAuthority: {
+      stable: "df9c9c3c5338a8b7299343c2397732b472a92d21eb75966db1193735a2be0d6a",
+      volatile: "d2108a25e07dea9599dea46c8d9aee666c10bb3fb202c051c1f9fe3eff850e6a",
+      finalMessages: "ce3e32eb99871decc7fb50178632932d3cfec15b588c6b13a52f6f40b0ff0b4c",
+    },
     expected: {
       stable: "b2c45067f3dd003a5cd5070c99cde7ac5a1db3b5d7d944487bccdbb69f0da93a",
       volatile: "a91bedf12493da9244f031696c1387bfebc23aeafb5b31925b29911cedc2ab3a",
@@ -19,6 +24,11 @@ const goldenCases = [
   },
   {
     name: "context-parity-gates",
+    sourceAuthority: {
+      stable: "9e1420e5cd362fc4e962c8c416192fe5a2e1f4ed2c00ae3342ace26c6f20d688",
+      volatile: "dcfae1757455fd89e074e6a1c802c30e182cefb80755eac326e97a0e61c43826",
+      finalMessages: "ff106a5ec8a651d36e3e3a8b6823127d5c8bd54a8abd6971cd2a8de9ddd26cc9",
+    },
     expected: {
       stable: "de6d76e354a5793efe8adc9404bd2570e5599b10ad7adae14550f29a970ab323",
       volatile: "997cafe9692e1f7b91f5230530c1735083125318b15bc2e655d1da7efe9a46d9",
@@ -35,6 +45,13 @@ const reports = [];
 for (const testCase of goldenCases) {
   const fixture = JSON.parse(await readFile(new URL(`../fixtures/${testCase.name}.json`, import.meta.url), "utf8"));
   const actual = buildContextParity(fixture);
+  const sourceComparable = buildContextParity({ ...fixture, includeChatPrompt: false });
+  const sourceComparableHashes = {
+    stable: hash(sourceComparable.stableSystemPrompt),
+    volatile: hash(sourceComparable.volatileContext),
+    finalMessages: hash(sourceComparable.finalMessages),
+  };
+  assert.deepEqual(sourceComparableHashes, testCase.sourceAuthority, `Current SullyOS source-authority parity drift (${testCase.name})`);
   const hashes = {
     stable: hash(actual.stableSystemPrompt), volatile: hash(actual.volatileContext), activated: hash(actual.activatedWorldbooks),
     recall: hash(actual.recallResult), finalMessages: hash(actual.finalMessages), modelConfig: hash(actual.modelConfig), stateChanges: hash(actual.stateChanges),
@@ -54,6 +71,6 @@ for (const testCase of goldenCases) {
     for (const stale of ["STALE_ROOM_PLATE_MUST_NOT_APPEAR", "STALE_RECALL_MUST_NOT_APPEAR", "STALE_BUFF_MUST_NOT_APPEAR"]) assert.ok(!`${actual.stableSystemPrompt}\n${actual.volatileContext}`.includes(stale));
     assert.ok(!actual.volatileContext.includes("当前时间 (Now)"));
   }
-  reports.push({ fixture: testCase.name, hashes });
+  reports.push({ fixture: testCase.name, hashes, sourceAuthority: sourceComparableHashes });
 }
 console.log(JSON.stringify({ ok: true, fixtures: reports }));
