@@ -4,16 +4,17 @@ SullyOS Memory Hub 是 SullyOS 的独立外置记忆库和后置认知设备。
 
 它不是 SullyOS 的替代前端，也不是只读的数据看板。它负责接收对话和外部材料，运行与 SullyOS 对齐的记忆处理，维护长期状态，并向 SullyOS、CC 或其他客户端返回可直接注入模型上下文的召回结果。
 
-> 当前结论：Hub 的记忆处理主干已经可以独立运行；但 SullyOS 的真实聊天发送、聊天前召回以及 Hub 写回 SullyOS 尚未全部接通。因此目前是“独立记忆运行时已成立，双向产品闭环未完成”。
+> 当前结论（2026-08-06）：Hub 端的 V2 权威存储、命令/事件、Scheduler、Outbox、MCP 和 CC Runner 已实现并通过回归测试；本地真实数据也已完成 V2 parity 校验与提升。尚未完成的是 VPS 正式部署、SullyOS 每轮消息增量上送、SullyOS Outbox pull/ACK，以及第一次真实 CC 唤醒。因此当前状态是“服务端 Bridge 已具备，线上端到端 Bridge 尚未接通”。
 
 ## 产品边界
 
 ### SullyOS 负责
 
-- 聊天和角色生活体验
+- 手机端普通聊天、气泡、卡片、音乐、通知和用户交互
+- 普通聊天暂时继续使用 SullyOS 当前主模型 API
 - 世界书、角色卡、示例对话和聊天消息
 - 应用、游戏、剧场、语音等前台功能
-- 在过渡阶段保存一部分角色源数据
+- 在过渡阶段保存可重建的本地缓存
 
 ### Memory Hub 负责
 
@@ -24,7 +25,16 @@ SullyOS Memory Hub 是 SullyOS 的独立外置记忆库和后置认知设备。
 - Legacy 日度碎片、月度精炼和月份召回
 - embedding、rerank、向量队列和语义召回
 - Breath、召回审计、备份、同步和维护
-- 在 VPS 上作为 SullyOS 与 CC 共用的记忆 API
+- 角色档案、完整消息、记忆、状态、事件和任务的权威数据
+- Scheduler、Event、Outbox、ACK、重试和幂等控制
+- 在 VPS 上作为 SullyOS 与 CC 共用的权威 API
+
+### CC / Claude Code 负责
+
+- 事件触发的随机自由活动、电脑操作、Code 区任务和复杂长期任务
+- 通过 MCP 读取 Hub 提供的角色上下文、增量聊天、状态与召回结果
+- 将自由活动结果原样提交给 Hub，不再经过普通聊天 API 二次润色
+- 普通聊天默认不调用 CC；CC 也不直接读取 `authority.sqlite`
 
 ### Memory Hub 不负责
 
@@ -37,20 +47,20 @@ SullyOS Memory Hub 是 SullyOS 的独立外置记忆库和后置认知设备。
 
 ```mermaid
 flowchart LR
-    S["SullyOS 聊天与角色前台"] -->|每轮消息| H["Memory Hub API / VPS"]
-    C["CC 或其他客户端"] -->|消息、查询、管理指令| H
-    H --> P["抽取 / EventBox / RoomPlate / Digest"]
-    H --> L["Legacy 月度精炼 / 印象 / 人格"]
-    H --> V["向量 / Rerank / Breath"]
-    P --> R["统一召回与最终上下文"]
-    L --> R
-    V --> R
-    R -->|聊天前注入| S
-    H -->|待写回操作| O["Outbox"]
-    O -->|pull + ack| S
+    U["用户"] --> S["SullyOS 手机端"]
+    S -->|普通聊天| A["SullyOS 主模型 API"]
+    A -->|角色回复| S
+    S -->|HTTPS：用户消息 + API 回复| H["Memory Hub / VPS"]
+    H --> M["记忆处理：Recall / Embedding / EventBox / RoomPlate / Digest"]
+    H --> J["唯一 Scheduler"]
+    J -->|autonomy.wake / computer.task| R["CC Runner"]
+    R <-->|MCP；底层使用本机 HTTP| H
+    R -->|自由活动正文与状态| H
+    H --> O["Event + Outbox"]
+    O -->|pull + ACK / Instant Push| S
 ```
 
-部署到 VPS 后，SullyOS 和 CC 都应主动连接 Hub。CC 不需要直接连接用户本机的 SullyOS；需要修改角色状态时，由 Hub 记录写回操作，SullyOS 拉取、确认并执行。
+这里有两条 Bridge：SullyOS ↔ Hub 使用 HTTPS、Outbox 和 ACK；CC ↔ Hub 使用 MCP。禁止形成 `Hub → CC → 普通 API` 的双模型串行回复。CC 不直接连接 SullyOS，也不下载完整记忆库。
 
 ## 当前完成度
 
@@ -72,9 +82,13 @@ flowchart LR
 | 召回审计 | 已完成 | 可查看候选、触发节点、展开盒、跳过项和最终注入段落 |
 | Breath | 已完成基础能力 | 搜索召回用于真实读取；自动浮现、目录、高重要度和 Feel 用于探索管理 |
 | SullyOS 快照同步 | 已完成 | 支持角色、记忆、门牌、事件盒、期盼、digest 等导入与镜像删除 |
+| V2 SQLite 权威运行时 | 已完成（本地） | 已完成真实数据 parity 与提升；运行读源为 V2 authority，原始大 JSON 仅保留迁移/恢复兼容 |
+| Command / Event / Snapshot / Scheduler | 已完成（Hub 端） | 稳定 ID、事件序号、角色快照、任务领取、忙碌延期和幂等处理均已实现 |
+| MCP 与 CC Runner | 已完成（代码与测试） | 9 个 MCP 工具、角色会话恢复、增量上下文和 `brain.wake` / `autonomy.wake` 执行链已实现；尚未做真实 VPS 唤醒 |
+| Outbox / ACK / retry | 已完成（Hub 端） | 可靠投递、客户端游标、ACK 与指数退避已实现；SullyOS 客户端持续 pull/ACK 尚未接通 |
 | 每轮聊天自动接入 | 未完成 | SullyOS 尚未在真实聊天链稳定 POST `/api/runtime/messages` |
 | 聊天前使用 Hub 召回 | 未完成 | SullyOS 当前仍主要调用本地 `injectMemoryPalace` |
-| Hub 写回 SullyOS | 未完成 | 还缺 outbox、拉取、确认、重试和冲突处理 |
+| Hub 写回 SullyOS | 部分完成 | Hub Outbox 已完成；还缺 SullyOS 侧拉取、渲染、ACK 与真实设备联调 |
 
 ## SullyOS、Hub 与 Ombre Brain 的差异
 
@@ -189,7 +203,7 @@ Hub 按 SullyOS UserImpression v3.0 工作：
 
 ## 同步与权威数据
 
-当前推荐过渡模式：**SullyOS 主数据 + Hub 独立镜像处理 + 显式写回**。
+当前推荐过渡模式：**Hub 权威运行时 + SullyOS 本地可重建缓存 + 一次性迁移/灾难恢复对比**。
 
 已支持：
 
@@ -199,29 +213,49 @@ Hub 按 SullyOS UserImpression v3.0 工作：
 - 只保留角色的最新档案状态，不把每次同步误当成多个并列档案
 - 按 `charId` 隔离角色记忆
 
-仍需实现：
+Hub 端已实现：
+
+- V2 增量行表与本地真实数据提升
+- commands、events、character snapshots、scheduled jobs、outbox deliveries、client cursors 与 idempotency keys
+- CC wake 领取、角色会话元数据、MCP 上下文读取与活动提交
+
+仍需接通：
 
 - SullyOS 每轮聊天自动推送
 - impression、refinedMemories、activeMemoryMonths、personality 等角色字段的即时增量同步
-- Hub outbox：待写回操作、版本、来源和时间
 - SullyOS pull/ack/retry
 - 删除、覆盖和并发修改的冲突预览
-- 最终 Hub-primary 模式
+- VPS 上的 HTTPS 入口、进程守护、数据库部署和首次真实 CC wake
 
 在双向同步完成前，不应宣传为“Hub 已完全替代 SullyOS 本地记忆存储”。
 
 ## VPS 与 CC 接入
 
-建议 API 流程：
+目标运行流程：
 
 1. SullyOS 每轮聊天结束后 POST `/api/runtime/messages`。
 2. Hub 独立运行抽取、EventBox、RoomPlate、digest 和向量任务。
-3. 下一次模型请求前，SullyOS 或 CC POST `/api/recall`。
-4. 客户端只使用返回的最终 formatter 上下文，不自行重写七房间语义。
-5. 需要修改 SullyOS 角色字段时，Hub 写入 outbox。
-6. SullyOS 定时拉取、展示冲突、执行并 ACK。
+3. 普通聊天继续由 SullyOS 主模型 API 完成，不经过 CC。
+4. Hub Scheduler 到期后创建 wake；CC Runner 只在事件触发时恢复对应角色会话。
+5. Hub 在唤醒前自动组装稳定人格层、增量聊天、状态变化、3–5 条召回记忆和未完成任务。
+6. CC 通过 MCP 深度查询并将自由活动结果原样写入 Hub。
+7. Hub 通过 Event + Outbox 投递；SullyOS 拉取、渲染并 ACK。
 
-VPS 还需要补充设备级 token、角色权限、离线重试、任务调度和数据库备份。
+VPS 尚未实际部署。部署时不上传 `.audit-backups`、recovery、`.env` 或本地日志；需要上传代码、单独制作的一致性 `authority.sqlite` 快照，并为 Hub 与 CC Runner 配置进程守护。CC Runner 应使用 VPS 上 Claude Code 的绝对可执行路径。
+
+CC Runner 为每个角色保存 `lastSeenMessageId`、`sessionId`、`stableContextVersion` 和 `lastWakeAt`。首次会话、重启、compact 或稳定上下文版本变化时发送完整稳定人格层；普通唤醒只发送新增原始聊天、状态变化、相关记忆和未完成任务，避免每次重复发送数万 Token 的完整上下文。
+
+MCP Server 使用 `MEMORY_HUB_URL` 与 `MEMORY_HUB_TOKEN` 通过 HTTP 调用 Hub，当前提供：
+
+- `sully_get_character_context`
+- `sully_get_recent_messages`
+- `sully_recall`
+- `sully_get_runtime_state`
+- `sully_commit_activity`
+- `sully_commit_message`
+- `sully_schedule_wake`
+- `sully_cancel_wake`
+- `sully_list_events`
 
 ## 主要 API
 
@@ -344,9 +378,10 @@ Hub 的权威实体、消息、Memory Runtime、版本、墓碑、审计和迁�
 
 ### P0：完成真实闭环
 
-1. 继续完善 Hub 自己的聊天执行器、上下文组装与状态 reducer。
-2. 由 Hub 的 SullyOS 兼容适配层接收旧字段，不要求修改 SullyOS 当前代码。
-3. 将 SullyOS 保留为可选迁移、灾难恢复与临时双向拉取对比来源；对比结果不落库。
+1. 将当前代码与一致性数据库快照部署到 VPS，配置 HTTPS、Token、Hub 与 CC Runner 进程守护。
+2. 完成一次真实 `autonomy.wake` 冒烟测试，验证 CC 会话恢复、MCP、活动提交、Event 与 Outbox。
+3. 接通 SullyOS 每轮用户/API 回复的增量上送，以及 Outbox pull/render/ACK。
+4. 将 SullyOS 保留为普通聊天前台、迁移/灾难恢复与临时双向拉取对比来源；对比结果不落库。
 
 ### P1：补齐 SullyOS 角色认知
 
@@ -358,11 +393,11 @@ Hub 的权威实体、消息、Memory Runtime、版本、墓碑、审计和迁�
 
 ### P2：生产化
 
-1. 完成 Memory Runtime JSON 到 SQLite 的剩余迁移。
-2. 加入 VPS 调度器、持久任务队列和离线恢复。
-3. 加入设备 token、角色权限和审计日志。
-4. 建立 SullyOS 与 Hub 的跨仓库 golden parity 测试。
-5. 清理重复快照、临时恢复文件和过期文档，但必须先备份并验证引用。
+1. 观察 V2 行表在真实聊天与 CC 高频写入下的性能，逐步冻结旧 JSON 写路径。
+2. 加入设备级权限、Token 轮换、限流、监控与自动数据库备份。
+3. 建立 SullyOS 与 Hub 的跨仓库端到端 golden parity 测试。
+4. 验证 Instant Push、离线重试、重复投递和多客户端游标。
+5. 只有在备份与引用验证完成后，才评估清理重复快照和过期恢复材料；默认不删除。
 
 ## 对齐验收标准
 

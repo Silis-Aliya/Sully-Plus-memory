@@ -1,6 +1,6 @@
 # SullyOS Memory Hub VPS Deploy
 
-Memory Hub is meant to sit between the SullyOS global Memory Palace and Ombre Brain.
+Memory Hub is the VPS authority and bridge shared by SullyOS and Claude Code. SullyOS uses HTTPS and Outbox; Claude Code uses the HTTP-backed MCP server. Ombre export remains an optional legacy integration and is not part of the required production message path.
 
 ```text
 phone / browser / SullyOS
@@ -8,9 +8,9 @@ phone / browser / SullyOS
         v
 https://memory.example.com  Memory Hub
         |
-        +--> SullyOS global Memory Palace read-only export endpoint
+        +--> authority.sqlite / Scheduler / Event / Outbox
         |
-        +--> Ombre Brain /api/sully/memories bridge
+        +--> MCP Server <--> Claude Code runner
 ```
 
 ## Required Runtime
@@ -35,11 +35,14 @@ Important variables:
 - `MEMORY_HUB_DATA_DIR=/var/lib/sully-memory-hub`
 - `MEMORY_HUB_TOKEN=...`
 - `MEMORY_HUB_ALLOWED_ORIGINS=https://memory.example.com,https://sully.example.com`
-- `SULLYOS_EXPORT_BASE_URL=https://sully.example.com`
-- `OMBRE_SULLY_BRIDGE_URL=https://ombre.example.com`
-- `OMBRE_SULLY_BRIDGE_KEY=...`
+- `MEMORY_HUB_RUNTIME_READ_MODE=v2`（only after parity verification and V2 promotion）
+- `MEMORY_HUB_RUNTIME_NATIVE_WRITES_ENABLED=true`（only after V2 promotion）
+- `MEMORY_HUB_URL=http://127.0.0.1:8787`
+- `CC_RUNNER_CLAUDE_COMMAND=/absolute/path/to/claude`
 
 Use a long random token for `MEMORY_HUB_TOKEN`. The dashboard sends it as `X-Memory-Hub-Token`.
+
+Do not upload a local `.env`, `.audit-backups`, recovery directories, logs, or `node_modules`. Transfer the code and a separately created, consistent `authority.sqlite` snapshot. Keep the original database and recovery material until the VPS copy has passed parity and smoke tests.
 
 ## Start Locally On VPS
 
@@ -135,7 +138,9 @@ The target display contract is:
 - `Anticipation` -> 窗台期盼 page
 - `DigestReport` -> 认知消化 page
 
-## Ombre Bridge Contract
+## Optional Legacy Ombre Bridge Contract
+
+This section is retained only for backward compatibility. The target SullyOS ↔ Hub ↔ CC architecture does not require Ombre and does not route CC activity through a second chat model.
 
 Memory Hub posts pending memories to:
 
