@@ -43,7 +43,13 @@ Important variables:
 
 Use a long random token for `MEMORY_HUB_TOKEN`. The dashboard sends it as `X-Memory-Hub-Token`.
 
-Do not upload a local `.env`, `.audit-backups`, recovery directories, logs, or `node_modules`. Transfer the code and a separately created, consistent `authority.sqlite` snapshot. Keep the original database and recovery material until the VPS copy has passed parity and smoke tests.
+Do not upload a local `.env`, `.audit-backups`, recovery directories, logs, or `node_modules`. Build the deployable V2-only snapshot locally, then transfer that file as the VPS `authority.sqlite`:
+
+```bash
+npm run snapshot:v2-deploy
+```
+
+The command refuses a database that is not V2-authoritative. It copies every V2 authority row, removes only legacy `runtime_messages` and the nine superseded runtime JSON mirrors from the new snapshot, then checks table counts and SQLite integrity. It never edits the local source database, recovery files, or backups. Keep the original database and recovery material until the VPS copy has passed smoke tests.
 
 `CC_RUNNER_WORKSPACE` is a base directory, not a shared role workspace. The runner creates one isolated directory per character containing a generated `CLAUDE.md` and a separate `workspace/`. The generated file combines the approved CC runtime rules with Hub's authoritative SullyOS stable context. Do not place a second manually maintained character persona in that directory.
 

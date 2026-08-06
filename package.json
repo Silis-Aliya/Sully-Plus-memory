@@ -9,6 +9,7 @@
     "start:cc-runner": "node cc-runner.mjs",
     "test:runtime": "node scripts/runtime-regression.mjs",
     "migrate:runtime-v2": "node scripts/runtime-v2-migrate.mjs",
+    "snapshot:v2-deploy": "node scripts/create-v2-deploy-snapshot.mjs",
     "status:runtime-v2": "node scripts/runtime-v2-status.mjs",
     "parity:runtime-v2": "node scripts/runtime-v2-parity.mjs",
     "test:runtime-v2": "node scripts/runtime-v2-regression.mjs",

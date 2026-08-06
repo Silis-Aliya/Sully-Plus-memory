@@ -295,7 +295,7 @@ Hub 与 SullyOS 的新服务端协议从 `packages/hub-contract` 统一发布。
 
 ### 权威档案与全量迁移
 
-角色、人设、User 档案、世界、世界书、挂载关系、版本、墓碑、审计与迁移报告存入 `authority.sqlite`。消息使用正式 `runtime_messages` 表，记忆、EventBox、RoomPlate、主动行为配置和世界/场景状态使用版本化 `runtime_domains`；旧 `hub_state_documents` 与 `migration_objects` 只参与一次性提升，提升成功后清空。管理页面的“权威档案”支持查看、新增、编辑、墓碑删除与世界书挂载，“运行中心”显示正式运行域计数。
+角色、人设、User 档案、世界、世界书、挂载关系、版本、墓碑、审计与迁移报告存入 `authority.sqlite`。在已提升的 V2 权威模式中，消息、记忆、向量、links、EventBox、RoomPlate、主动行为配置和世界/场景状态分别写入 `v2_*` 增量行表；旧 `runtime_messages` 与对应 `runtime_domains` 大 JSON 只保留在本地原库作为迁移/恢复镜像，不再接收新的运行写入。旧 `hub_state_documents` 与 `migration_objects` 只参与一次性提升，提升成功后清空。管理页面的“权威档案”支持查看、新增、编辑、墓碑删除与世界书挂载，“运行中心”显示正式运行域计数。
 
 - `GET|POST /api/v1/characters`
 - `GET|PUT|PATCH|DELETE /api/v1/characters/:id`
@@ -346,11 +346,11 @@ Hub 分别配置：
 
 ## 存储与备份
 
-Hub 的权威实体、消息、Memory Runtime、版本、墓碑、审计和迁移报告全部存入 `authority.sqlite`。`hub-data.json` 不参与运行；SullyOS 对比结果仅存在于当前预览响应，不作为 Hub 存储。导出备份应覆盖 SQLite 中的权威实体与正式运行域；密钥应单独处理，不默认写入可分享备份。
+Hub 的权威实体、消息、Memory Runtime、版本、墓碑、审计和迁移报告全部存入 `authority.sqlite`。`hub-data.json` 不参与运行；SullyOS 对比结果仅存在于当前预览响应，不作为 Hub 存储。`npm run snapshot:v2-deploy` 生成适合 VPS 的 V2-only 数据库快照：保留所有 V2 权威行和配置表，不携带旧版消息表及已替代的大 JSON 镜像。导出备份应覆盖 SQLite 中的权威实体与正式运行域；密钥应单独处理，不默认写入可分享备份。
 
 `GET /api/runtime/storage` 返回消息正文、内嵌媒体、消息 JSON、SQLite 文件和配置配额的占用。新消息默认限制为：纯文本 64 KB、单条内嵌媒体 1 MB、完整消息对象 2 MB；VPS 存储告警阈值为配额的 70%，危险阈值为 85%。这些值可用 `.env` 的 `MEMORY_HUB_MESSAGE_TEXT_MAX_BYTES`、`MEMORY_HUB_INLINE_MEDIA_MAX_BYTES`、`MEMORY_HUB_MESSAGE_JSON_MAX_BYTES` 和 `MEMORY_HUB_STORAGE_QUOTA_BYTES` 调整。
 
-当前数据量已经不适合长期依赖单一大 JSON。权威层已经迁入 SQLite，下一阶段还需把既有记忆运行时从 JSON 迁入事务存储，并建立：
+当前数据量不适合长期依赖单一大 JSON。V2 权威运行时已迁入 SQLite 行表；本地原库仍保留旧镜像以便灾难恢复，而 VPS 快照不携带这些镜像。后续重点是：
 
 - 按 charId、room、时间、EventBox 和向量状态的索引
 - 原子事务和崩溃恢复
@@ -376,7 +376,7 @@ Hub 的权威实体、消息、Memory Runtime、版本、墓碑、审计和迁�
 
 ### P2：生产化
 
-1. 观察 V2 行表在真实聊天与 CC 高频写入下的性能，逐步冻结旧 JSON 写路径。
+1. 观察 V2 行表在真实聊天与 CC 高频写入下的性能；旧 JSON 写路径已冻结，保持本地恢复用途。
 2. 加入设备级权限、Token 轮换、限流、监控与自动数据库备份。
 3. 建立 SullyOS 与 Hub 的跨仓库端到端 golden parity 测试。
 4. 验证 Instant Push、离线重试、重复投递和多客户端游标。

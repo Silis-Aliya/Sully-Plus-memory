@@ -349,7 +349,7 @@ export class RuntimeV2Migrator {
   repairVectorSourceShape(readDb, writeDb) {
     const row = readDb.prepare("SELECT 1 FROM runtime_domains WHERE domain_key='hub:vectors'").get();
     if (!row) return 0;
-    const update = writeDb.prepare("UPDATE v2_memory_vectors SET source_vector_field=?,source_had_dimensions=? WHERE memory_id=? AND (source_vector_field<>? OR source_had_dimensions<>?)");
+    const update = writeDb.prepare("UPDATE v2_memory_vectors SET dimensions=CAST(length(vector_blob)/4 AS INTEGER),source_vector_field=?,source_had_dimensions=? WHERE memory_id=? AND (dimensions<>CAST(length(vector_blob)/4 AS INTEGER) OR source_vector_field<>? OR source_had_dimensions<>?)");
     let changed = 0;
     writeDb.exec("BEGIN IMMEDIATE");
     try {
@@ -358,6 +358,42 @@ export class RuntimeV2Migrator {
         CASE WHEN json_type(j.value,'$.dimensions') IS NULL THEN 0 ELSE 1 END had_dimensions
         FROM runtime_domains r,json_each(r.data_json) j WHERE r.domain_key='hub:vectors'`).iterate()) {
         changed += Number(update.run(source.vector_field, Number(source.had_dimensions), source.memory_id, source.vector_field, Number(source.had_dimensions)).changes || 0);
+      }
+      writeDb.exec("COMMIT");
+      return changed;
+    } catch (error) {
+      try { writeDb.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  repairVectorPayloadParity(readDb, writeDb) {
+    const row = readDb.prepare("SELECT 1 FROM runtime_domains WHERE domain_key='hub:vectors'").get();
+    if (!row) return 0;
+    const upsert = writeDb.prepare(`UPDATE v2_memory_vectors
+      SET character_id=?,model=?,dimensions=?,vector_blob=?,vector_hash=?,source_vector_field=?,source_had_dimensions=?,updated_at=?,raw_metadata_json=?
+      WHERE memory_id=? AND (character_id IS NOT ? OR model IS NOT ? OR dimensions<>? OR vector_hash<>? OR source_vector_field<>? OR source_had_dimensions<>? OR updated_at<>? OR raw_metadata_json<>?)`);
+    let changed = 0;
+    writeDb.exec("BEGIN IMMEDIATE");
+    try {
+      for (const source of readDb.prepare("SELECT j.value AS data_json FROM runtime_domains r,json_each(r.data_json) j WHERE r.domain_key='hub:vectors'").iterate()) {
+        const item = json(source.data_json, null);
+        if (!item || !text(item.memoryId)) continue;
+        const field = asArray(item.vector).length ? "vector" : "embedding";
+        const values = asArray(item[field]);
+        if (!values.length) continue;
+        const buffer = vectorBuffer(values);
+        const metadata = { ...item };
+        delete metadata.vector;
+        delete metadata.embedding;
+        const characterId = text(item.charId) || null;
+        const model = text(item.model);
+        const dimensions = values.length;
+        const vectorHash = sha256(buffer);
+        const sourceHadDimensions = Object.hasOwn(item, "dimensions") ? 1 : 0;
+        const updatedAt = iso(item.updatedAt);
+        const rawMetadata = JSON.stringify(metadata);
+        changed += Number(upsert.run(characterId, model, dimensions, buffer, vectorHash, field, sourceHadDimensions, updatedAt, rawMetadata, text(item.memoryId), characterId, model, dimensions, vectorHash, field, sourceHadDimensions, updatedAt, rawMetadata).changes || 0);
       }
       writeDb.exec("COMMIT");
       return changed;
@@ -420,6 +456,7 @@ export class RuntimeV2Migrator {
       migrated.messageSequences = this.backfillMessageSourceSequences(readDb, writeDb);
       migrated.messageRawParity = this.repairMessageRawParity(readDb, writeDb);
       migrated.vectorShapes = this.repairVectorSourceShape(readDb, writeDb);
+      migrated.vectorPayloadParity = this.repairVectorPayloadParity(readDb, writeDb);
 
       const memoryInsert = writeDb.prepare(`INSERT INTO v2_memory_nodes(memory_id,character_id,room,content,title,importance,mood,tags_json,event_box_id,archived,is_box_summary,embedded,occurred_at,created_at,updated_at,raw_json,content_hash,deleted_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(memory_id) DO UPDATE SET raw_json=excluded.raw_json,content_hash=excluded.content_hash`);
@@ -441,7 +478,7 @@ export class RuntimeV2Migrator {
         const buffer = vectorBuffer(values);
         const metadata = { ...item };
         delete metadata.vector; delete metadata.embedding;
-        vectorInsert.run(id, text(item.charId) || null, text(item.model), Number(item.dimensions || values.length), buffer, sha256(buffer), field, Object.hasOwn(item, "dimensions") ? 1 : 0, iso(item.updatedAt), JSON.stringify(metadata));
+        vectorInsert.run(id, text(item.charId) || null, text(item.model), values.length, buffer, sha256(buffer), field, Object.hasOwn(item, "dimensions") ? 1 : 0, iso(item.updatedAt), JSON.stringify(metadata));
       });
 
       const linkInsert = writeDb.prepare(`INSERT INTO v2_memory_links(link_id,character_id,source_memory_id,target_memory_id,link_type,strength,activation_count,last_activated_at,raw_json,content_hash)

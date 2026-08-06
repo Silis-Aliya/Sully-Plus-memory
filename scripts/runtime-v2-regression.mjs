@@ -46,7 +46,7 @@ try {
   assert.equal(before.targetCounts.memories, 0);
 
   const first = migrator.apply();
-  assert.deepEqual(first.migrated, { messages: 1, messageSequences: 0, messageRawParity: 0, vectorShapes: 0, memories: 2, vectors: 2, links: 1, eventBoxes: 1, roomPlates: 1, anticipations: 1, digestReports: 1, characterRuntime: 0, sourceOrder: 9 });
+  assert.deepEqual(first.migrated, { messages: 1, messageSequences: 0, messageRawParity: 0, vectorShapes: 0, vectorPayloadParity: 0, memories: 2, vectors: 2, links: 1, eventBoxes: 1, roomPlates: 1, anticipations: 1, digestReports: 1, characterRuntime: 0, sourceOrder: 9 });
   assert.equal(first.validation.ok, true);
   assert.deepEqual(first.validation.countDifferences, {});
   assert.deepEqual(first.validation.integrity, { vectorsWithoutMemory: 0, linksWithoutSource: 0, linksWithoutTarget: 0, eventMembersWithoutMemory: 0, invalidVectorBytes: 0 });
@@ -62,7 +62,7 @@ try {
   check.close();
 
   const second = migrator.apply();
-  assert.deepEqual(second.migrated, { messages: 0, messageSequences: 0, messageRawParity: 0, vectorShapes: 0, memories: 0, vectors: 0, links: 0, eventBoxes: 0, roomPlates: 0, anticipations: 0, digestReports: 0, characterRuntime: 0, sourceOrder: 0 });
+  assert.deepEqual(second.migrated, { messages: 0, messageSequences: 0, messageRawParity: 0, vectorShapes: 0, vectorPayloadParity: 0, memories: 0, vectors: 0, links: 0, eventBoxes: 0, roomPlates: 0, anticipations: 0, digestReports: 0, characterRuntime: 0, sourceOrder: 0 });
   assert.equal(second.validation.ok, true);
   console.log(JSON.stringify({ ok: true, databaseFile, migrated: first.migrated, validation: second.validation.integrity }));
 } finally {

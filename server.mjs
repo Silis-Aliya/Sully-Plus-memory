@@ -313,8 +313,22 @@ function loadHubRuntimeDomains() {
 function persistHubRuntimeDomains(canonical) {
   const desired = new Set(Object.keys(canonical || {}).map((key) => `hub:${key}`));
   const current = authorityStore.listRuntimeDomainKeys();
-  for (const [key, value] of Object.entries(canonical || {})) authorityStore.putRuntimeDomain(`hub:${key}`, value);
-  for (const key of current) if (key.startsWith("hub:") && !desired.has(key)) authorityStore.deleteRuntimeDomain(key);
+  const v2Authoritative = authorityStore.runtimeV2.authorityMode() === "v2";
+  for (const [key, value] of Object.entries(canonical || {})) {
+    const domainKey = `hub:${key}`;
+    if (v2Authoritative && V2_RUNTIME_DOMAINS.includes(key)) {
+      authorityStore.runtimeV2.replaceDomain(domainKey, value, { sourceHash: contentHash(value), sourceVersion: 0 });
+    } else {
+      authorityStore.putRuntimeDomain(domainKey, value);
+    }
+  }
+  for (const key of current) {
+    if (!key.startsWith("hub:") || desired.has(key)) continue;
+    const domain = key.slice(4);
+    // V2 is authoritative: legacy mirrors stay frozen for recovery, never updated or deleted by runtime writes.
+    if (v2Authoritative && V2_RUNTIME_DOMAINS.includes(domain)) continue;
+    authorityStore.deleteRuntimeDomain(key);
+  }
 }
 
 function loadMessageRuntime() {
@@ -327,7 +341,11 @@ function persistMessageRuntime(runtime) {
   const meta = { ...(runtime || EMPTY_RUNTIME) };
   const messages = Array.isArray(meta.messages) ? meta.messages : [];
   delete meta.messages;
-  authorityStore.replaceRuntimeMessages(messages);
+  if (authorityStore.runtimeV2.authorityMode() === "v2") {
+    authorityStore.runtimeV2.replaceMessages({ allMessages: messages, sourceHash: contentHash(messages), sourceVersion: 0 });
+  } else {
+    authorityStore.replaceRuntimeMessages(messages);
+  }
   authorityStore.putRuntimeDomain("message:meta", meta);
 }
 
