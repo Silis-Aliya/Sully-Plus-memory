@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/worldbook.schema.json",
+  "title": "Worldbook",
+  "type": "object",
+  "required": ["worldbookId", "title", "content", "version", "updatedAt"],
+  "properties": {
+    "worldbookId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+    "content": { "type": "string" },
+    "category": { "type": "string" },
+    "keys": { "type": "array", "items": { "type": "string" } },
+    "secondaryKeys": { "type": "array", "items": { "type": "string" } },
+    "constant": { "type": "boolean" },
+    "selective": { "type": "boolean" },
+    "selectiveLogic": { "type": "integer", "minimum": 0, "maximum": 3 },
+    "order": { "type": "integer" },
+    "position": { "type": "integer", "minimum": 0, "maximum": 6 },
+    "disabled": { "type": "boolean" },
+    "probability": { "type": "number", "minimum": 0, "maximum": 100 },
+    "useProbability": { "type": "boolean" },
+    "depth": { "type": "integer", "minimum": 0 },
+    "role": { "type": ["integer", "null"], "minimum": 0, "maximum": 2 },
+    "scanDepth": { "type": ["integer", "null"], "minimum": 0 },
+    "caseSensitive": { "type": ["boolean", "null"] },
+    "matchWholeWords": { "type": ["boolean", "null"] },
+    "version": { "type": "integer", "minimum": 1 },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "deletedAt": { "type": ["string", "null"], "format": "date-time" }
+  },
+  "additionalProperties": true
+}

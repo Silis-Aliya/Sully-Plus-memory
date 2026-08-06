@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/user-profile.schema.json",
+  "title": "UserIdentity",
+  "type": "object",
+  "required": ["userId", "name", "version", "updatedAt"],
+  "properties": {
+    "userId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "avatar": { "type": ["string", "null"] },
+    "bio": { "type": "string" },
+    "voiceProfile": { "type": ["object", "null"] },
+    "perCharacter": { "type": "object", "additionalProperties": { "type": "object" } },
+    "presence": { "type": ["object", "null"] },
+    "version": { "type": "integer", "minimum": 1 },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "deletedAt": { "type": ["string", "null"], "format": "date-time" }
+  },
+  "additionalProperties": true
+}

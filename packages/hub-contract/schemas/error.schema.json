@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/error.schema.json",
+  "title": "HubError",
+  "type": "object",
+  "required": ["ok", "code", "message", "retryable"],
+  "properties": {
+    "ok": { "const": false },
+    "code": { "type": "string", "enum": ["UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "VALIDATION_FAILED", "PROTOCOL_VERSION_UNSUPPORTED", "VERSION_CONFLICT", "COMMAND_ALREADY_PROCESSED", "RATE_LIMITED", "RUNTIME_BUSY", "MODEL_FAILED", "INTERNAL_ERROR"] },
+    "message": { "type": "string" },
+    "retryable": { "type": "boolean" },
+    "requestId": { "type": ["string", "null"] },
+    "details": { "type": ["object", "null"] },
+    "currentVersion": { "type": ["integer", "null"], "minimum": 0 }
+  },
+  "additionalProperties": false
+}

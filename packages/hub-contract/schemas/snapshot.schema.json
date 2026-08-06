@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/snapshot.schema.json",
+  "title": "CharacterSnapshot",
+  "type": "object",
+  "required": ["snapshotId", "characterId", "snapshotVersion", "lastEventId", "createdAt", "protocolVersion", "state"],
+  "properties": {
+    "snapshotId": { "type": "string", "minLength": 1 },
+    "characterId": { "type": "string", "minLength": 1 },
+    "snapshotVersion": { "type": "integer", "minimum": 1 },
+    "lastEventId": { "type": "integer", "minimum": 0 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "protocolVersion": { "type": "string" },
+    "character": { "type": ["object", "null"] },
+    "user": { "type": ["object", "null"] },
+    "world": { "type": ["object", "null"] },
+    "state": { "type": "object" },
+    "recentMessages": { "type": "array", "items": { "type": "object" } }
+  },
+  "additionalProperties": false
+}

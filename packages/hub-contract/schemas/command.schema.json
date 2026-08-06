@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/command.schema.json",
+  "title": "HubCommand",
+  "type": "object",
+  "required": ["commandId", "type", "actorId", "issuedAt", "protocolVersion", "payload"],
+  "properties": {
+    "commandId": { "type": "string", "minLength": 8, "maxLength": 128 },
+    "type": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]+$" },
+    "actorId": { "type": "string", "minLength": 1 },
+    "characterId": { "type": ["string", "null"] },
+    "worldId": { "type": ["string", "null"] },
+    "expectedVersion": { "type": ["integer", "null"], "minimum": 0 },
+    "issuedAt": { "type": "string", "format": "date-time" },
+    "protocolVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+    "client": { "type": ["object", "null"] },
+    "payload": { "type": "object" },
+    "unset": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+  },
+  "additionalProperties": false
+}

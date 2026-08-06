@@ -64,7 +64,7 @@ flowchart LR
 | Anticipation | 已完成 | 保留 `fulfill`、`disappoint`、`keep` 生命周期 |
 | Digest | 已完成 | 自动轮次、手动运行、窗口期盼、事件盒和门牌处理 |
 | self insight | 已完成 | 旧 `selfInsights` 保真；新 `self_insight` 写入 self_room 的“我是谁”门牌 |
-| Legacy 月度记忆 | 已完成 | 日度 MemoryFragment 精炼到 `refinedMemories[YYYY-MM]`，支持月份激活与 `[[RECALL: YYYY-MM]]` |
+| Legacy 月度记忆 | 已完成 | 日度 MemoryFragment 精炼到 `refinedMemories[YYYY-MM]`，支持智能月份下拉激活；API 仍兼容 `[[RECALL: YYYY-MM]]` |
 | UserImpression v3.0 | 已完成 | 首次生成读取近期 15 条，更新读取近期 50 条，并结合长期角色上下文 |
 | 人格检测 | 部分完成 | 检测 API 已有；仍需补齐 SullyOS 的“待确认 -> 用户确认 -> 写回角色”完整流程 |
 | 向量写回 | 已完成 | 新增、修改、归档和摘要状态进入 embedding 队列，rerank 可参与召回 |
@@ -165,7 +165,7 @@ SullyOS 的日度 MemoryFragment 与 Memory Palace 是两条并行记忆线。Hu
 - 按月收集日度 MemoryFragment
 - 使用 SullyOS 原版月度模板生成 `refinedMemories[YYYY-MM]`
 - 激活月份后可注入该月的详细记忆
-- 支持 `[[RECALL: YYYY-MM]]`
+- 支持按月份下拉召回详细日志；当前月无记录时自动选择最近有记录的月份，API 仍兼容 `[[RECALL: YYYY-MM]]`
 
 ### TA 对用户的印象
 
@@ -266,6 +266,55 @@ VPS 还需要补充设备级 token、角色权限、离线重试、任务调度�
 - `/api/sully/anticipations`
 - `/api/sully/digest-reports`
 
+### Hub Contract
+
+Hub 与 SullyOS 的新服务端协议从 `packages/hub-contract` 统一发布。当前协议版本为 `1.0`、契约包版本为 `1.1.0`，包括角色、User 档案、世界、世界书、Command、Event、Message、Snapshot 和标准错误九类 JSON Schema。
+
+- `GET /api/contracts`：协议清单、真实运行阶段和能力发现
+- `GET /api/contracts/schemas/:name`：读取指定 Schema
+- `POST /api/contracts/validate`：按协议版本验证请求对象
+
+管理页面左侧的“运行中心”显示协议版本、已接通能力和下一阶段。普通用户不直接编辑 Schema；角色运行状态、客户端、事件游标、冲突、定时行动和迁移报告将在对应服务端模块完成后逐项启用。
+
+### 权威档案与全量迁移
+
+角色、人设、User 档案、世界、世界书、挂载关系、版本、墓碑、审计与迁移报告存入 `authority.sqlite`。消息使用正式 `runtime_messages` 表，记忆、EventBox、RoomPlate、主动行为配置和世界/场景状态使用版本化 `runtime_domains`；旧 `hub_state_documents` 与 `migration_objects` 只参与一次性提升，提升成功后清空。管理页面的“权威档案”支持查看、新增、编辑、墓碑删除与世界书挂载，“运行中心”显示正式运行域计数。
+
+- `GET|POST /api/v1/characters`
+- `GET|PUT|PATCH|DELETE /api/v1/characters/:id`
+- `GET|POST /api/v1/users`
+- `GET|PUT|PATCH|DELETE /api/v1/users/:id`
+- `GET|POST /api/v1/worlds`
+- `GET|PUT|PATCH|DELETE /api/v1/worlds/:id`
+- `GET|POST /api/v1/worldbooks`
+- `GET|PUT|PATCH|DELETE /api/v1/worldbooks/:id`
+- `GET /api/v1/characters/:id/worldbooks`
+- `POST|DELETE /api/v1/characters/:id/worldbooks/:worldbookId`
+- `GET /api/v1/audit`
+- `GET /api/v1/authority/stats`
+- `POST /api/v1/migrations/sully/preview`
+- `POST /api/v1/migrations/sully/import`
+- `GET /api/v1/migrations`
+- `GET /api/v1/migrations/:id`
+
+迁移入口接收 SullyOS 已组装完成的安全迁移 JSON。SullyOS 的 Memory Hub 设置页可直接“预检完整迁移”，核对报告后再确认写入；迁移包不会携带 API Key、Token、云凭据和外观数据。提交报告包含源对象、导入、跳过、缺失引用、不支持字段和哈希差异。SullyOS v2 ZIP 分片包仍应先组装为 JSON，Hub 暂不直接解包浏览器备份 ZIP。
+
+### Context parity
+
+`contextParity.mjs` 按 SullyOS `utils/context.ts` 与 `utils/worldbook.ts` 搬运核心上下文语义，不修改原 prompt。当前对齐范围包括人设/世界观/User/Impression/Legacy/RoomPlate、Memory Palace recall 的 stable/volatile 分层、情绪状态、世界书 0–6 位置、关键词激活、宏展开、深度插入和最终消息数组。
+
+普通文字聊天现已继续接入 SullyOS `utils/chatPrompts.ts` 当前会启用的原文固定块：`Chat App Rules`、语音关闭提示、`关于对方的表达` 与 `最后，回到你自己`。Hub 保持 SullyOS 的三段式顺序：stable system → 历史消息（含世界书 depth）→ volatile system/recency。原文搬运由 `npm run test:chat-prompt` 的固定 SHA-256 锁定；修改任何字符都会失败。语音开启、小红书、Notion/飞书日记、音乐、HTML、思考链、点餐和通用 MCP 等条件块只有在 Hub 同时具备对应运行数据与 handler 后才会按 SullyOS 原条件启用，当前不伪装为已完成。
+
+- `POST /api/v1/context/preview`：传入固定角色、User、消息、时间与状态，返回 stable system prompt、volatile context、激活世界书、recall、最终消息数组和状态变化。
+- 管理页“上下文组装”：按权威来源分块查看角色人设、世界观、User、Impression、Legacy、RoomPlate、Recall、运行状态、世界书和 Chat Prompt；重新组装 Stable/Volatile/最终消息数组，并可临时粘贴 SullyOS 的最终文本做字符级双栏对比。对比文本不落库。
+- `npm run test:context-parity`：使用 `fixtures/context-parity-p0.json` 与 SullyOS 原生 ContextBuilder 的 golden hashes 比较；任一字符、激活列表、recall、消息顺序或状态变化漂移都会失败。
+- `npm run test:chat-prompt`：锁定已接入的 SullyOS Chat Prompt 原文固定块与 recency 钢印。
+- `npm run test:memory-palace-prompts`：直接读取 `SULLYOS_ROOT`（默认 `D:\SullyOS-fork`）中的 SullyOS 原模板，逐字符比较固定输入下最终渲染文本，并锁定记忆提取、迁移、外部记忆、事件盒压缩/二次压缩、RoomPlate、认知消化和人格判断的原文 SHA-256。SullyOS 原文或 Hub 输出任一漂移都会失败。
+
+若请求同时携带 `recallQuery` 与 `memoryState`，preview 会先运行 Hub 的真实 recall，再把召回文本放入 volatile context，而不是读取预制 recall 文本。
+
+RoomPlate 使用 SullyOS `底色认知 (Resident Knowledge)` 原文，Memory Palace 的七个房间标签与描述逐字对齐 SullyOS。正式 recall 会在 `runtime_memory_access` 记录访问时间/次数，并在 `runtime_coactivations` 以每次 `0.05`、上限 `1.0` 持久化同批前五条记忆的共同激活；preview 仅返回 `stateChanges`，不会写入状态表。
+
 完整字段和请求格式以 `server.mjs` 的路由实现为准。
 
 ## 模型配置
@@ -280,9 +329,11 @@ Hub 分别配置：
 
 ## 存储与备份
 
-当前 Hub 仍以 JSON 数据文件为主要持久化方式。导出备份应覆盖 Hub 自身状态，包括角色、记忆、门牌、事件盒、期盼、digest、Legacy、印象、人格、向量元数据和配置；密钥应单独处理，不默认写入可分享备份。
+Hub 的权威实体、消息、Memory Runtime、版本、墓碑、审计和迁移报告全部存入 `authority.sqlite`。`hub-data.json` 不参与运行；SullyOS 对比结果仅存在于当前预览响应，不作为 Hub 存储。导出备份应覆盖 SQLite 中的权威实体与正式运行域；密钥应单独处理，不默认写入可分享备份。
 
-当前数据量已经不适合长期依赖单一大 JSON。下一阶段应迁移到 SQLite 或等价的事务型存储，并建立：
+`GET /api/runtime/storage` 返回消息正文、内嵌媒体、消息 JSON、SQLite 文件和配置配额的占用。新消息默认限制为：纯文本 64 KB、单条内嵌媒体 1 MB、完整消息对象 2 MB；VPS 存储告警阈值为配额的 70%，危险阈值为 85%。这些值可用 `.env` 的 `MEMORY_HUB_MESSAGE_TEXT_MAX_BYTES`、`MEMORY_HUB_INLINE_MEDIA_MAX_BYTES`、`MEMORY_HUB_MESSAGE_JSON_MAX_BYTES` 和 `MEMORY_HUB_STORAGE_QUOTA_BYTES` 调整。
+
+当前数据量已经不适合长期依赖单一大 JSON。权威层已经迁入 SQLite，下一阶段还需把既有记忆运行时从 JSON 迁入事务存储，并建立：
 
 - 按 charId、room、时间、EventBox 和向量状态的索引
 - 原子事务和崩溃恢复
@@ -293,9 +344,9 @@ Hub 分别配置：
 
 ### P0：完成真实闭环
 
-1. 在 SullyOS 真实聊天提交点接入 `/api/runtime/messages`。
-2. 在 SullyOS 模型请求前接入 Hub `/api/recall`。
-3. 实现 Hub outbox 与 SullyOS pull/ack/retry/conflict。
+1. 继续完善 Hub 自己的聊天执行器、上下文组装与状态 reducer。
+2. 由 Hub 的 SullyOS 兼容适配层接收旧字段，不要求修改 SullyOS 当前代码。
+3. 将 SullyOS 保留为可选迁移、灾难恢复与临时双向拉取对比来源；对比结果不落库。
 
 ### P1：补齐 SullyOS 角色认知
 
@@ -307,7 +358,7 @@ Hub 分别配置：
 
 ### P2：生产化
 
-1. JSON 迁移 SQLite。
+1. 完成 Memory Runtime JSON 到 SQLite 的剩余迁移。
 2. 加入 VPS 调度器、持久任务队列和离线恢复。
 3. 加入设备 token、角色权限和审计日志。
 4. 建立 SullyOS 与 Hub 的跨仓库 golden parity 测试。
@@ -326,9 +377,61 @@ Hub 分别配置：
 
 任何 prompt 修改都必须先展示完整 prompt 并经用户确认。
 
+## Hub 权威命令与聊天接口
+
+当前已提供第一阶段的独立执行链：
+
+- `POST /v1/commands`：接收带稳定 `commandId` 的幂等命令。
+- `POST /v1/chat/turns`：Hub 组装上下文、调用模型、保存用户与角色消息，并提交角色快照。
+- `GET /v1/events?after=<eventId>&characterId=<id>&clientId=<id>`：按严格递增事件序号拉取变化并推进客户端游标。
+- `GET /v1/characters/:id/snapshot`：读取可重建客户端状态的角色快照。
+
+SQLite 已建立并实际使用 `commands`、`events`、`character_snapshots`、`scheduled_jobs`、`outbox_deliveries`、`client_cursors`、`idempotency_keys`；字段修改审计继续使用现有 `authority_audit`。聊天接口完成纯文本权威回合与重放保护。SullyOS 不需要接入或修改，仍可作为迁移与 parity 对比来源。卡片、工具循环以及由模型自主决定的主动行动仍属于后续阶段。
+
+### Hub 内部区域隔离
+
+Hub 运行消息统一带有 `surface`、`visibility`、`conversationId` 和 `origin`。`surface` 固定为 `chat`、`activity`、`world`、`state`、`memory`、`schedule` 或 `system`；旧消息在读取时按角色、消息类型和元数据自动补齐分类。只有 `surface=chat` 且 `visibility=user` 的消息会进入独立聊天、Context 历史、角色快照近期消息、Impression 与聊天记忆缓冲。彼方活动、世界变化、状态、记忆、日程和系统记录即使属于同一角色，也不会进入聊天。
+
+- `GET /api/runtime/messages?charId=<id>&surface=chat&visibility=user`：按区域和可见性读取运行消息。
+- `GET /v1/events?characterId=<id>&surface=activity&visibility=internal`：按区域读取事件。
+- Hub 管理页“独立聊天”只展示用户可见对话，并显示七个区域的事件计数。
+- 默认直接会话 ID 为 `direct:me:<characterId>`；非聊天区域的 `conversationId` 固定为 `null`。
+
+该隔离仅在 Memory Hub 内实现，不要求修改 SullyOS。
+
+Hub 聊天 Context 同时原样复用 SullyOS `utils/scheduleInjection.ts` 的日程状态注入：从 Hub 权威 Snapshot 读取当前 `activity`、`location` 与 `innerState`，并与迁移入 Hub 的当日日程合并后写入现有 volatile `runtimeStateContext`。这些状态是角色知道的自身事实；SullyOS 原文中的“不是台词，不用说出口”规则保持不变。`npm run test:schedule-injection` 锁定 SullyOS 源文件 SHA-256 与固定输入的完整渲染文本。
+
+管理页面左侧的“独立聊天”直接使用上述 Hub 接口，可以选择角色、查看 Hub 中的历史消息、发送新回合，并查看该角色的 Context preview、事件和快照。整个页面不依赖 SullyOS 在线，也不会改写 SullyOS 仓库。
+
+### SullyOS 输入兼容层（仅 Hub）
+
+Hub 内部提供一层旧 SullyOS 聊天字段适配；它把 `charId`、`message.text`、`messageId` 等旧输入规范化为 Hub command，但不会向 SullyOS 写代码或要求 SullyOS 改用该接口。
+
+- `GET /api/v1/compat/sully`：查看兼容版本、接受字段与当前限制。
+- `POST /api/v1/compat/sully/chat/preview`：只预览规范化结果，不执行聊天、不写消息。
+- `POST /api/v1/compat/sully/chat/turns`：按兼容格式执行 Hub 权威聊天回合。
+- `npm run test:sully-compat`：验证旧字段映射、稳定幂等 ID 与限制提示。
+- `npm run test:hub-ui`：验证独立聊天页面和浏览器脚本可加载。
+
+当前兼容执行支持纯文本；群聊、附件、卡片和 SullyOS 专用动作会给出明确 warning，后续应在 Hub 内增加对应 reducer，而不是回到 SullyOS 增加第二套执行逻辑。
+
+### 行动运行时与 Outbox
+
+Hub 进程默认每 5 秒检查一次到期任务。定时器只负责唤醒；`Character Runtime` 会先读取角色快照中的 `busyUntil`、`nextAvailableAt`、`available` 和活动状态，角色忙碌时自动延期。执行完成后统一产生 Event、更新状态与角色快照；若任务携带明确消息内容，则写入一条 Hub 权威主动消息。当前不会为了主动行动新增或修改 prompt，也不会擅自调用模型生成内容。
+
+- `POST /v1/scheduled-jobs`：建立幂等定时任务。
+- `GET /v1/scheduled-jobs`：按角色或状态查询任务。
+- `GET|DELETE /v1/scheduled-jobs/:id`：查看或取消任务。
+- `POST /v1/runtime/tick`：手动检查并执行到期任务。
+- `GET /v1/outbox?clientId=<id>&after=<eventId>`：为指定客户端领取可靠事件投递。
+- `POST /v1/outbox/:deliveryId/ack`：确认投递并推进客户端游标。
+- `POST /v1/outbox/:deliveryId/retry`：记录失败并按指数退避重试。
+
+管理页“运行中心”可以为当前角色建立行动、主动消息或状态更新任务，手动触发 tick，并查看/ACK/重试 Outbox。自动运行可通过 `MEMORY_HUB_ACTION_RUNTIME_ENABLED` 开关，检查间隔由 `MEMORY_HUB_ACTION_RUNTIME_INTERVAL_MS` 配置。
+
 ## 本地运行
 
-要求 Node.js 18 或更高版本。
+要求 Node.js 22.5 或更高版本（使用内置 `node:sqlite`）。
 
 ```powershell
 npm start

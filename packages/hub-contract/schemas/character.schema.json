@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/character.schema.json",
+  "title": "CharacterDefinition",
+  "type": "object",
+  "required": ["characterId", "name", "version", "updatedAt"],
+  "properties": {
+    "characterId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "avatar": { "type": ["string", "null"] },
+    "description": { "type": "string" },
+    "systemPrompt": { "type": "string" },
+    "worldview": { "type": "string" },
+    "exampleDialogue": { "type": "array", "items": { "type": "object" } },
+    "writerPersona": { "type": "string" },
+    "personalityStyle": { "type": "string" },
+    "ruminationTendency": { "type": "number", "minimum": 0, "maximum": 1 },
+    "mountedWorldbookIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "timeZone": { "type": ["string", "null"] },
+    "version": { "type": "integer", "minimum": 1 },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "deletedAt": { "type": ["string", "null"], "format": "date-time" },
+    "sourceAuthority": { "type": "string", "enum": ["hub", "sullyos_import", "client"] }
+  },
+  "additionalProperties": false
+}

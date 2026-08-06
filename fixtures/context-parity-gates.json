@@ -1,0 +1,45 @@
+{
+  "now": 1785760440000,
+  "lastInteractionTs": 1785753240000,
+  "modelConfig": { "provider": "local", "model": "gate-model", "temperature": 0.2 },
+  "character": {
+    "id": "char-gates",
+    "name": "岚",
+    "description": "记录者",
+    "systemPrompt": "你是岚。只依据真实经历作答。",
+    "worldview": "城市的旧档案馆仍在开放。",
+    "timeAwarenessEnabled": false,
+    "memoryPalaceEnabled": false,
+    "roomPlatesInjection": "STALE_ROOM_PLATE_MUST_NOT_APPEAR",
+    "memoryPalaceInjection": "STALE_RECALL_MUST_NOT_APPEAR",
+    "scheduleFeatureEnabled": false,
+    "scheduleStyle": "structured",
+    "emotionConfig": { "enabled": true },
+    "buffInjection": "STALE_BUFF_MUST_NOT_APPEAR",
+    "impression": {
+      "version": 3,
+      "lastUpdated": 1785750000000,
+      "value_map": { "likes": ["安静阅读"], "dislikes": [], "core_values": "求真" },
+      "behavior_profile": { "tone_style": "直接", "emotion_summary": "不确定时会先核对", "response_patterns": "" },
+      "emotion_schema": { "triggers": { "positive": [], "negative": ["虚构事实"] }, "comfort_zone": "给出证据", "stress_signals": [] },
+      "personality_core": { "observed_traits": ["谨慎"], "interaction_style": "先确认再判断", "summary": "重视事实" },
+      "observed_changes": [{ "period": "2026-08", "description": "开始主动说明不确定性" }]
+    },
+    "mountedWorldbooks": [
+      { "id": "wb-whole", "title": "档案规则", "content": "只在提到 archive 时激活。", "constant": false, "key": ["archive"], "matchWholeWords": true, "caseSensitive": false, "scanDepth": 2, "position": 1, "order": 10 },
+      { "id": "wb-disabled", "title": "禁用规则", "content": "不应出现。", "constant": true, "disable": true, "position": 1, "order": 20 }
+    ]
+  },
+  "userProfile": { "id": "user-gates", "name": "澄", "bio": "正在整理 archive index。" },
+  "messages": [
+    { "role": "user", "content": "请检查 archive，不要检查 archivedata。" },
+    { "role": "assistant", "content": "我会逐条核对。" }
+  ],
+  "roomPlatesContext": "STALE_ROOM_PLATE_MUST_NOT_APPEAR",
+  "memoryPalaceContext": "STALE_RECALL_MUST_NOT_APPEAR",
+  "runtimeStateContext": "### 当前场景状态\n档案馆闭馆前还有十分钟。\n",
+  "recencyTail": "### 回到你自己\n不要把推测说成事实。\n",
+  "recallResult": { "items": [], "memoryPalaceContext": "" },
+  "stateChanges": []
+}
+

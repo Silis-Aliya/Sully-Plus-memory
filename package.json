@@ -5,9 +5,40 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test:runtime": "node scripts/runtime-regression.mjs"
+    "start:mcp": "node mcp-server.mjs",
+    "start:cc-runner": "node cc-runner.mjs",
+    "test:runtime": "node scripts/runtime-regression.mjs",
+    "migrate:runtime-v2": "node scripts/runtime-v2-migrate.mjs",
+    "status:runtime-v2": "node scripts/runtime-v2-status.mjs",
+    "parity:runtime-v2": "node scripts/runtime-v2-parity.mjs",
+    "test:runtime-v2": "node scripts/runtime-v2-regression.mjs",
+    "test:runtime-v2-shadow": "node scripts/runtime-v2-shadow-regression.mjs",
+    "test:runtime-v2-parity": "node scripts/runtime-v2-parity-regression.mjs",
+    "test:runtime-read-mode": "node scripts/runtime-read-mode-regression.mjs",
+    "test:runtime-v2-native-command": "node scripts/runtime-v2-native-command-regression.mjs",
+    "test:runtime-v2-native-api": "node scripts/runtime-v2-native-api-regression.mjs",
+    "test:runtime-v2-promotion": "node scripts/runtime-v2-promotion-regression.mjs",
+    "test:mcp": "node scripts/mcp-server-regression.mjs",
+    "test:cc-runner": "node scripts/cc-runner-regression.mjs",
+    "test:contract": "node scripts/contract-regression.mjs",
+    "test:authority": "node scripts/authority-regression.mjs",
+    "test:authority-api": "node scripts/authority-api-regression.mjs",
+    "test:context-parity": "node scripts/context-parity-regression.mjs",
+    "test:sully-compat": "node scripts/sully-compat-regression.mjs",
+    "test:hub-ui": "node scripts/hub-ui-regression.mjs",
+    "test:chat-prompt": "node scripts/chat-prompt-regression.mjs",
+    "test:schedule-injection": "node scripts/schedule-injection-regression.mjs",
+    "test:vr-context": "node scripts/vr-context-regression.mjs",
+    "test:memory-palace-prompts": "node scripts/memory-palace-prompt-regression.mjs"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0"
   }
 }

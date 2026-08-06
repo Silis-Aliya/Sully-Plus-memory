@@ -1,0 +1,22 @@
+[Unit]
+Description=SullyOS Memory Hub Claude Code Runner
+After=network-online.target sully-memory-hub.service
+Wants=network-online.target
+Requires=sully-memory-hub.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sully-memory-hub
+EnvironmentFile=/opt/sully-memory-hub/.env
+ExecStart=/usr/bin/node /opt/sully-memory-hub/cc-runner.mjs
+Restart=on-failure
+RestartSec=10
+User=sully
+Group=sully
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/sully-memory-hub
+
+[Install]
+WantedBy=multi-user.target

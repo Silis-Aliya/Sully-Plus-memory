@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/message.schema.json",
+  "title": "HubMessage",
+  "type": "object",
+  "required": ["charId", "role", "content", "timestamp", "surface", "visibility", "origin"],
+  "properties": {
+    "id": { "type": ["integer", "null"], "minimum": 1 },
+    "charId": { "type": "string", "minLength": 1 },
+    "sourceId": { "type": "string" },
+    "role": { "type": "string", "enum": ["user", "assistant", "system"] },
+    "type": { "type": "string" },
+    "content": { "type": "string" },
+    "timestamp": { "type": "number", "minimum": 0 },
+    "surface": { "type": "string", "enum": ["chat", "activity", "world", "state", "memory", "schedule", "system"] },
+    "visibility": { "type": "string", "enum": ["user", "internal"] },
+    "conversationId": { "type": ["string", "null"] },
+    "origin": { "type": "string", "minLength": 1 },
+    "metadata": { "type": "object" }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/world.schema.json",
+  "title": "WorldDefinition",
+  "type": "object",
+  "required": ["worldId", "name", "version", "updatedAt"],
+  "properties": {
+    "worldId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 300 },
+    "description": { "type": "string" },
+    "rules": { "type": ["object", "array", "string", "null"] },
+    "members": { "type": "array", "items": { "type": "object" } },
+    "locations": { "type": "array", "items": { "type": "object" } },
+    "state": { "type": ["object", "null"] },
+    "version": { "type": "integer", "minimum": 1 },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "deletedAt": { "type": ["string", "null"], "format": "date-time" }
+  },
+  "additionalProperties": true
+}

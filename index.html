@@ -5613,6 +5613,31 @@
       }
     }
 
+    .hub-chat-shell { display:grid; grid-template-columns:minmax(0,1fr) 310px; gap:14px; min-height:560px; }
+    .hub-chat-main, .hub-chat-side { border:1px solid var(--line); border-radius:18px; background:var(--panel); overflow:hidden; }
+    .hub-chat-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:13px 15px; border-bottom:1px solid var(--line); background:linear-gradient(135deg,rgba(20,184,166,.08),rgba(139,92,246,.05)); }
+    .hub-chat-head h3 { margin:0; font-size:14px; }
+    .hub-chat-head p { margin:3px 0 0; color:var(--muted); font-size:11px; }
+    .hub-zone-tabs { display:flex; gap:6px; flex-wrap:wrap; padding:10px 14px; border-bottom:1px solid var(--line); background:var(--soft); }
+    .hub-zone-tab { cursor:pointer; font:inherit; }
+    .hub-zone-tab.active { color:var(--accent); border-color:rgba(20,184,166,.4); background:rgba(20,184,166,.12); }
+    .hub-chat-log { min-height:390px; max-height:58vh; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
+    .hub-chat-bubble { max-width:82%; padding:10px 12px; border-radius:15px; background:var(--soft); border:1px solid var(--line); align-self:flex-start; }
+    .hub-chat-bubble.user { align-self:flex-end; background:rgba(20,184,166,.11); border-color:rgba(20,184,166,.22); }
+    .hub-chat-bubble.system { max-width:96%; align-self:center; background:rgba(245,158,11,.08); }
+    .hub-chat-bubble p { margin:0; white-space:pre-wrap; word-break:break-word; line-height:1.55; font-size:13px; }
+    .hub-chat-bubble small { display:block; margin-top:6px; color:var(--muted); font-size:10px; }
+    .hub-chat-compose { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:9px; padding:12px; border-top:1px solid var(--line); }
+    .hub-chat-compose textarea { min-height:64px; max-height:160px; resize:vertical; padding:11px 12px; border:1px solid var(--line); border-radius:13px; background:var(--bg); color:var(--text); font:13px/1.5 inherit; }
+    .hub-chat-compose .btn { min-width:90px; }
+    .hub-chat-side { padding:13px; display:flex; flex-direction:column; gap:10px; }
+    .hub-chat-side .detail-card { margin:0; }
+    .hub-chat-event { padding:9px 10px; border:1px solid var(--line); border-radius:11px; background:var(--soft); }
+    .hub-chat-event b { display:block; font-size:11px; }
+    .hub-chat-event span { color:var(--muted); font-size:10px; }
+    @media (max-width: 980px) { .hub-chat-shell { grid-template-columns:minmax(0,1fr); } .hub-chat-side { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    @media (max-width: 620px) { .hub-chat-shell { min-height:0; } .hub-chat-side { grid-template-columns:minmax(0,1fr); } .hub-chat-log { min-height:320px; max-height:52vh; } .hub-chat-compose { grid-template-columns:minmax(0,1fr); } .hub-chat-compose .btn { width:100%; } }
+
     @media (min-width: 521px) {
       .duplicate-compare-body {
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5801,7 +5826,6 @@
             <button class="btn" id="previewSync">预览同步差异</button>
             <button class="btn primary" id="exportBackup">导出 Hub 备份</button>
           </div>
-          <input id="jsonFile" class="hidden-input" type="file" accept=".json,application/json" />
         </section>
 
         <section class="safety">
@@ -5811,6 +5835,9 @@
       </aside>
     </div>
   </div>
+
+  <input id="jsonFile" class="hidden-input" type="file" accept=".json,application/json" />
+  <input id="migrationFile" class="hidden-input" type="file" accept=".json,application/json" />
 
   <div class="drawer-backdrop" id="settingsModal">
     <div class="modal">
@@ -5986,10 +6013,26 @@
     let view = localStorage.getItem("memoryHub.view") || "rooms", prevView = "rooms", activeChar = localStorage.getItem("memoryHub.activeChar") || "", activeRoom = localStorage.getItem("memoryHub.activeRoom") || "living_room", activeEventBox = localStorage.getItem("memoryHub.activeEventBox") || "", query = "", activeFeelKey = "", breathMode = localStorage.getItem("memoryHub.breathMode") || "surface", recallRoomFilter = localStorage.getItem("memoryHub.recallRoomFilter") || "", recallEventBoxMode = localStorage.getItem("memoryHub.recallEventBoxMode") || "compat", recallEventBoxLiveLimit = Number(localStorage.getItem("memoryHub.recallEventBoxLiveLimit") || 5), roomSort = "time", roomSortDir = "desc", mapMode = "rooms", activeImpressionArchive = localStorage.getItem("memoryHub.impressionArchive") || "latest", relationScope = localStorage.getItem("memoryHub.relationScope") || "global", relationDepth = Number(localStorage.getItem("memoryHub.relationDepth") || 2), relationMode = localStorage.getItem("memoryHub.relationMode") || "memory", relationVisualMode = localStorage.getItem("memoryHub.relationVisualMode") || "atlas", activeNetworkNode = "", sullyImportCharId = "";
     let impressionRunStatus = "";
     let impressionRunFailed = false;
+    let contractStatus = null;
+    let contractStatusLoading = false;
+    let authorityStats = null;
+    let migrationReports = [];
+    let migrationPreview = null;
+    let pendingMigrationBackup = null;
+    let migrationBusy = false;
+    let authorityRegistryType = localStorage.getItem("memoryHub.authorityRegistryType") || "characters";
+    let authorityRegistryItems = [];
+    let authorityRegistryLoading = false;
+    let authorityRegistryLoadedType = "";
     let breathAutoRan = false;
     let breathRequestSeq = 0;
     let duplicateResult = null;
     let runtimeStatusByChar = {};
+    let independentChatSurface = localStorage.getItem("memoryHub.independentChatSurface") || "chat";
+    if (!["chat","activity","world","state","memory","schedule","system"].includes(independentChatSurface)) independentChatSurface = "chat";
+    let independentChatState = { charId:"", surface:"", messages:[], events:[], snapshot:null, surfaceCounts:{}, eventSurfaceCounts:{}, loading:false, sending:false, error:"" };
+    let contextAssemblyState = { charId:"", result:null, query:"", sullyText:"", loading:false, error:"" };
+    let actionRuntimeState = { charId:"", jobs:[], deliveries:[], clientId:"hub-admin-ui", loaded:false, loading:false, error:"" };
     let relationNetworkData = null, relationNetworkRAF = null, relationNetworkListeners = false, relationNetworkAngle = 0;
     let relationCosmosAutoRotate = true, relationCosmosShowLabels = true, relationCosmosShowAllLinks = false;
     let relationVectorValuesLoading = false;
@@ -6179,7 +6222,7 @@
       $("sullyDot").classList.toggle("warn", !settings.sullyUrl);
       $("modeStatus").textContent = settings.syncMode === "readonly" ? "只看不写 · 点开查看" : settings.syncMode === "preview" ? "可预览同步 · 点开查看" : "手动外部桥接 · 点开查看";
     }
-    const roleLockedViews = new Set(["plates", "impressions", "coreMemories", "feel", "syncLog", "eventBoxes", "digests", "searchIndex"]);
+    const roleLockedViews = new Set(["contextAssembly", "plates", "impressions", "coreMemories", "feel", "syncLog", "eventBoxes", "digests", "searchIndex"]);
     function navItem(key, label, icon) {
       const locked = roleLockedViews.has(key) && !hasRoleScope();
       return `<button class="nav ${view===key && !locked ? "active" : ""} ${locked ? "locked" : ""}" data-view="${key}" ${locked ? `data-locked="role" title="先选择一个 TA"` : ""}>${icon}<span class="nav-text">${label}</span>${locked ? `<span class="nav-lock">未解锁</span>` : ""}</button>`;
@@ -6191,6 +6234,10 @@
       $("sidebar").innerHTML = [
         navItem("connect","使用教程",icons.upload),
         navItem("roles","TA 索引",icons.users),
+        navItem("runtimeCenter","运行中心",icons.db),
+        navItem("independentChat","独立聊天",icons.wave),
+        navItem("contextAssembly","上下文组装",icons.spark),
+        navItem("authorityRegistry","权威档案",icons.users),
         '<div class="nav-divider"></div>',
         navItem("rooms","记忆房间",icons.home),
         navItem("plates","门牌 / 地标",icons.pin),
@@ -6230,6 +6277,10 @@
       if (view === "connect") return renderConnect();
       if (view === "overview") return setView("rooms");
       if (view === "roles") return renderRoles();
+      if (view === "runtimeCenter") return renderRuntimeCenter();
+      if (view === "independentChat") return renderIndependentChat();
+      if (view === "contextAssembly") return renderContextAssembly();
+      if (view === "authorityRegistry") return renderAuthorityRegistry();
       if (view === "roomDetail") return renderRoomDetail();
       if (view === "rooms") return renderMapPanel();
       if (view === "plates") return renderPlates();
@@ -6287,6 +6338,699 @@
       $("connectFetch").onclick = fetchSully;
       $("connectImport").onclick = () => $("jsonFile").click();
       $("connectOverview").onclick = () => setView("rooms");
+    }
+
+    async function loadContractStatus(force = false) {
+      if (!serverMode()) return;
+      if (contractStatusLoading || (contractStatus && !force)) return;
+      contractStatusLoading = true;
+      try {
+        const [contracts, stats, migrations] = await Promise.all([
+          api("/api/contracts"),
+          api("/api/v1/authority/stats"),
+          api("/api/v1/migrations?limit=20")
+        ]);
+        contractStatus = contracts;
+        authorityStats = stats;
+        migrationReports = migrations.items || [];
+      } catch (error) {
+        contractStatus = { error: error?.message || String(error) };
+      } finally {
+        contractStatusLoading = false;
+        if (view === "runtimeCenter") renderRuntimeCenter();
+      }
+    }
+
+    function runtimeCapabilityRows(items, status) {
+      const tone = status === "implemented" ? "var(--green)" : "var(--amber)";
+      const label = status === "implemented" ? "已接通" : "待建设";
+      return (items || []).map(item => `<div class="memory-item"><div class="memory-top"><b>${esc(item)}</b><span class="chip" style="color:${tone}">${label}</span></div></div>`).join("");
+    }
+
+    function migrationCountRows(counts = {}) {
+      const entries = Object.entries(counts).filter(([, value]) => Number(value) > 0);
+      if (!entries.length) return `<div class="empty">没有对象</div>`;
+      return `<div class="card-meta">${entries.map(([key,value]) => `<span class="chip">${esc(key)} · ${Number(value)}</span>`).join("")}</div>`;
+    }
+
+    function migrationReportCard(item) {
+      const report = item.report || item;
+      const imported = Object.values(report.importedCounts || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+      const skipped = Object.values(report.skippedCounts || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+      return `<article class="memory-item"><div class="memory-top"><b>${esc(report.migrationId || item.migrationId || "迁移报告")}</b><span class="chip" style="color:var(--green)">${esc(report.status || item.status || "completed")}</span></div><p>${formatTime(report.completedAt || item.completedAt || report.createdAt || item.createdAt)}</p><div class="card-meta"><span class="chip">导入 ${imported}</span><span class="chip">跳过 ${skipped}</span><span class="chip">缺失引用 ${(report.missingReferences || []).length}</span><span class="chip">哈希差异 ${(report.hashDifferences || []).length}</span></div></article>`;
+    }
+
+    async function previewMigrationFile(file) {
+      migrationBusy = true;
+      migrationPreview = null;
+      pendingMigrationBackup = null;
+      renderRuntimeCenter();
+      try {
+        const raw = await file.text();
+        const backup = JSON.parse(raw);
+        const result = await api("/api/v1/migrations/sully/preview", { method:"POST", body:JSON.stringify({ backup }) });
+        pendingMigrationBackup = backup;
+        migrationPreview = { ...result.report, sourceHash: result.sourceHash, fileName: file.name, fileBytes: file.size };
+        toast("全量备份预检完成，尚未写入。请检查报告后确认迁移。");
+      } catch (error) {
+        migrationPreview = { error: error?.message || String(error), fileName: file.name };
+        toast(`迁移预检失败：${error?.message || error}`);
+      } finally {
+        migrationBusy = false;
+        renderRuntimeCenter();
+      }
+    }
+
+    async function commitMigration() {
+      if (!pendingMigrationBackup || !migrationPreview || migrationPreview.error) return toast("请先选择并通过预检的 SullyOS 全量 JSON 备份。");
+      if (!confirm("将把预检过的人设、User、世界书、消息、记忆、主动配置和必要世界状态写入 Hub 权威库。继续吗？")) return;
+      migrationBusy = true;
+      renderRuntimeCenter();
+      try {
+        const result = await api("/api/v1/migrations/sully/import", { method:"POST", body:JSON.stringify({ backup:pendingMigrationBackup, actorId:"memory-hub-ui", mode:"disaster-recovery-import" }) });
+        migrationPreview = result.report;
+        pendingMigrationBackup = null;
+        contractStatus = null;
+        authorityStats = null;
+        migrationReports = [];
+        toast("SullyOS 全量迁移已提交到 Hub 权威库。");
+        await loadContractStatus(true);
+      } catch (error) {
+        migrationPreview = { ...migrationPreview, error:error?.message || String(error) };
+        toast(`全量迁移失败：${error?.message || error}`);
+      } finally {
+        migrationBusy = false;
+        if (view === "runtimeCenter") renderRuntimeCenter();
+      }
+    }
+
+    const authorityRegistryMeta = {
+      characters: { label:"角色", idField:"characterId", endpoint:"/api/v1/characters", template:{ characterId:"", name:"", description:"", systemPrompt:"", worldview:"" } },
+      users: { label:"User 档案", idField:"userId", endpoint:"/api/v1/users", template:{ userId:"me", name:"", bio:"" } },
+      worldbooks: { label:"世界书", idField:"worldbookId", endpoint:"/api/v1/worldbooks", template:{ worldbookId:"", title:"", content:"", category:"", constant:true, keys:[] } },
+      worlds: { label:"世界", idField:"worldId", endpoint:"/api/v1/worlds", template:{ worldId:"", name:"", description:"", rules:{} } }
+    };
+
+    async function loadAuthorityRegistry(force = false) {
+      if (authorityRegistryLoading || (!force && authorityRegistryLoadedType === authorityRegistryType)) return;
+      authorityRegistryLoading = true;
+      try {
+        const meta = authorityRegistryMeta[authorityRegistryType];
+        const result = await api(`${meta.endpoint}?includeDeleted=1&limit=1000`);
+        authorityRegistryItems = result.items || [];
+        authorityRegistryLoadedType = authorityRegistryType;
+      } catch (error) {
+        authorityRegistryItems = [];
+        toast(`权威档案读取失败：${error?.message || error}`);
+      } finally {
+        authorityRegistryLoading = false;
+        if (view === "authorityRegistry") renderAuthorityRegistry();
+      }
+    }
+
+    function authorityItemTitle(type, item) {
+      if (type === "worldbooks") return item.title || item.worldbookId;
+      return item.name || item[authorityRegistryMeta[type].idField];
+    }
+
+    function authorityItemSubtitle(type, item) {
+      if (type === "characters") return item.description || item.worldview || "暂无角色简介";
+      if (type === "users") return item.bio || "暂无 User 简介";
+      if (type === "worldbooks") return item.category || String(item.content || "").slice(0,120) || "暂无内容";
+      return item.description || "暂无世界简介";
+    }
+
+    function editableAuthorityData(item) {
+      const next = { ...(item || {}) };
+      for (const key of ["version","updatedAt","deletedAt","sourceAuthority","_hash","_fieldVersions"]) delete next[key];
+      return next;
+    }
+
+    function mediaDataUriInfo(value) {
+      if (typeof value !== "string" || !value.startsWith("data:")) return null;
+      const match = value.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
+      if (!match || !/^(image|audio|video)\//i.test(match[1])) return null;
+      const payload = match[2].replace(/\s/g, "");
+      const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+      return { mime:match[1].toLowerCase(), bytes:Math.max(0,Math.floor(payload.length*3/4)-padding) };
+    }
+
+    function authorityMediaBytes(bytes) {
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1048576) return `${(bytes/1024).toFixed(1)} KB`;
+      return `${(bytes/1048576).toFixed(1)} MB`;
+    }
+
+    function foldAuthorityMedia(value) {
+      const token = `__MEMORY_HUB_MEDIA_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
+      const entries = [];
+      const walk = (current, path = []) => {
+        const info = mediaDataUriInfo(current);
+        if (info) {
+          const index = entries.length;
+          const placeholder = `${token}${index}`;
+          entries.push({ index, path:path.join("."), value:current, ...info, placeholder });
+          return placeholder;
+        }
+        if (Array.isArray(current)) return current.map((item,index) => walk(item,[...path,String(index)]));
+        if (current && typeof current === "object") return Object.fromEntries(Object.entries(current).map(([key,nested]) => [key,walk(nested,[...path,key])]));
+        return current;
+      };
+      return { data:walk(value), entries, token };
+    }
+
+    function restoreAuthorityMedia(value, folded) {
+      const byPlaceholder = new Map(folded.entries.map(entry => [entry.placeholder,entry.value]));
+      const walk = current => {
+        if (typeof current === "string" && current.startsWith(folded.token)) {
+          if (!byPlaceholder.has(current)) throw new Error("媒体占位符已被修改；请关闭编辑窗口后重新打开再保存。");
+          return byPlaceholder.get(current);
+        }
+        if (Array.isArray(current)) return current.map(walk);
+        if (current && typeof current === "object") return Object.fromEntries(Object.entries(current).map(([key,nested]) => [key,walk(nested)]));
+        return current;
+      };
+      return walk(value);
+    }
+
+    function authorityMediaPreview(entries) {
+      if (!entries.length) return "";
+      const total = entries.reduce((sum,entry)=>sum+entry.bytes,0);
+      return `<div class="detail-card" style="margin-bottom:12px"><div class="memory-top"><div><h3>媒体字段已折叠</h3><p>图片不会显示在 JSON 长文本中；保存时会自动还原原始数据。</p></div><span class="chip">${entries.length} 项 · ${authorityMediaBytes(total)}</span></div><div style="display:flex;gap:10px;overflow:auto;padding-top:10px">${entries.map(entry=>`<div style="flex:0 0 132px;border:1px solid var(--line);border-radius:12px;padding:8px;background:var(--panel)">${entry.mime.startsWith("image/")?`<img src="${esc(entry.value)}" alt="${esc(entry.path)}" style="display:block;width:100%;height:104px;object-fit:cover;border-radius:8px;background:var(--soft)">`:`<div style="height:104px;display:grid;place-items:center;border-radius:8px;background:var(--soft);font-size:12px">${esc(entry.mime)}</div>`}<b style="display:block;margin-top:7px;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(entry.path)}">${esc(entry.path||"媒体")}</b><span style="font-size:10px;color:var(--muted)">${authorityMediaBytes(entry.bytes)}</span></div>`).join("")}</div><p style="margin-top:9px;font-size:11px;color:var(--muted)">如需删除媒体字段，请删除 JSON 中对应的占位符属性；不要修改占位符文字本身。</p></div>`;
+    }
+
+    function openAuthorityEditor(type, item = null) {
+      const meta = authorityRegistryMeta[type];
+      const initial = item ? editableAuthorityData(item) : { ...meta.template };
+      const foldedMedia = foldAuthorityMedia(initial);
+      $("infoTitle").textContent = item ? `编辑${meta.label}` : `新增${meta.label}`;
+      $("infoBody").innerHTML = `<div class="safety"><b>版本规则</b>${item?`当前 v${item.version}；保存时带 expectedVersion，旧版本不会覆盖新版本。`:`创建后由 Hub 分配 v1。`}</div><br>${authorityMediaPreview(foldedMedia.entries)}<textarea id="authorityJsonEditor" style="width:100%;min-height:360px;padding:14px;border-radius:12px;background:var(--panel);color:var(--text);border:1px solid var(--line);font:12px/1.6 ui-monospace,monospace">${esc(JSON.stringify(foldedMedia.data,null,2))}</textarea><br><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" id="saveAuthorityEntity">保存</button>${item&&!item.deletedAt?`<button class="btn" id="deleteAuthorityEntity" style="color:var(--rose)">标记删除</button>`:""}${item?.deletedAt?`<span class="chip" style="color:var(--rose)">已删除墓碑 · ${esc(item.deletedAt)}</span>`:""}</div>`;
+      openModal("infoModal");
+      $("saveAuthorityEntity").onclick = async () => {
+        try {
+          const data = restoreAuthorityMedia(JSON.parse($("authorityJsonEditor").value),foldedMedia);
+          const id = String(data[meta.idField] || item?.[meta.idField] || "").trim();
+          if (!id) throw new Error(`${meta.idField} 不能为空`);
+          const result = await api(item ? `${meta.endpoint}/${encodeURIComponent(id)}` : meta.endpoint, {
+            method:item?"PATCH":"POST",
+            body:JSON.stringify({ data, ...(item?{ expectedVersion:item.version }:{}), actorId:"memory-hub-ui" })
+          });
+          closeModal("infoModal");
+          authorityRegistryItems = [];
+          authorityRegistryLoadedType = "";
+          await loadAuthorityRegistry(true);
+          contractStatus = null;
+          toast(`${meta.label}已保存为 v${result.item.version}。`);
+        } catch (error) {
+          toast(`保存失败：${error?.message || error}`);
+        }
+      };
+      if ($("deleteAuthorityEntity")) $("deleteAuthorityEntity").onclick = async () => {
+        if (!confirm(`删除不会抹掉记录，而是为这个${meta.label}创建墓碑。继续吗？`)) return;
+        try {
+          const id = item[meta.idField];
+          await api(`${meta.endpoint}/${encodeURIComponent(id)}`, { method:"DELETE", body:JSON.stringify({ expectedVersion:item.version, actorId:"memory-hub-ui" }) });
+          closeModal("infoModal");
+          authorityRegistryItems = [];
+          authorityRegistryLoadedType = "";
+          await loadAuthorityRegistry(true);
+          contractStatus = null;
+          toast(`${meta.label}已标记删除。`);
+        } catch (error) { toast(`删除失败：${error?.message || error}`); }
+      };
+    }
+
+    async function openMountManager(character) {
+      try {
+        const [booksResult, mountsResult] = await Promise.all([
+          api("/api/v1/worldbooks?limit=1000"),
+          api(`/api/v1/characters/${encodeURIComponent(character.characterId)}/worldbooks?includeDeleted=1`)
+        ]);
+        const mounts = new Map((mountsResult.items || []).map(item => [item.worldbookId,item]));
+        $("infoTitle").textContent = `${character.name || character.characterId} · 世界书挂载`;
+        $("infoBody").innerHTML = `<div class="safety"><b>挂载关系也是版本化实体</b>卸载会保留墓碑，离线客户端不会把旧挂载重新传回来。</div><br><div class="memory-list">${(booksResult.items||[]).length?(booksResult.items||[]).map(book=>{const mount=mounts.get(book.worldbookId);const active=mount&&!mount.deletedAt;return `<div class="memory-item"><div class="memory-top"><b>${esc(book.title||book.worldbookId)}</b><button class="btn" data-toggle-mount="${esc(book.worldbookId)}" data-mounted="${active?"1":"0"}" data-mount-version="${mount?.version||0}">${active?"卸载":"挂载"}</button></div><p>${esc(book.category||String(book.content||"").slice(0,100))}</p></div>`}).join(""):`<div class="empty">还没有权威世界书。请先在“权威档案 → 世界书”中新建或迁移。</div>`}</div>`;
+        openModal("infoModal");
+        document.querySelectorAll("[data-toggle-mount]").forEach(button => button.onclick = async () => {
+          try {
+            const mounted = button.dataset.mounted === "1";
+            await api(`/api/v1/characters/${encodeURIComponent(character.characterId)}/worldbooks/${encodeURIComponent(button.dataset.toggleMount)}`, { method:mounted?"DELETE":"POST", body:JSON.stringify({ expectedVersion:Number(button.dataset.mountVersion||0), actorId:"memory-hub-ui" }) });
+            await openMountManager(character);
+            toast(mounted?"世界书已卸载。":"世界书已挂载。" );
+          } catch (error) { toast(`挂载操作失败：${error?.message || error}`); }
+        });
+      } catch (error) { toast(`挂载列表读取失败：${error?.message || error}`); }
+    }
+
+    function renderAuthorityRegistry() {
+      const meta = authorityRegistryMeta[authorityRegistryType];
+      if (authorityRegistryLoadedType !== authorityRegistryType && !authorityRegistryLoading) void loadAuthorityRegistry();
+      $("mainPanel").innerHTML = panel("权威档案", "这里编辑的是 Hub 服务端权威状态，不是浏览器本地镜像", `<div class="content-scroll">
+        <div class="segmented">${Object.entries(authorityRegistryMeta).map(([key,item])=>`<button data-authority-type="${key}" class="${authorityRegistryType===key?"active":""}">${item.label}</button>`).join("")}</div>
+        <br>
+        <div class="safety ok"><b>SQLite 权威层</b>所有保存都有字段契约、版本号、哈希和审计；删除生成 Tombstone。SullyOS 当前尚未切换为这些 API 的客户端。</div>
+        <br>
+        ${authorityRegistryLoading?`<div class="empty">正在读取权威档案…</div>`:authorityRegistryItems.length?`<div class="card-grid">${authorityRegistryItems.map(item=>`<article class="card" style="${item.deletedAt?"opacity:.62":""}"><div class="memory-top"><h3>${esc(authorityItemTitle(authorityRegistryType,item))}</h3><span class="chip" style="color:${item.deletedAt?"var(--rose)":"var(--green)"}">${item.deletedAt?"墓碑":`v${item.version}`}</span></div><p>${esc(authorityItemSubtitle(authorityRegistryType,item))}</p><div class="card-meta"><span class="chip">${esc(item[meta.idField])}</span><span class="chip">${esc(item.sourceAuthority||"hub")}</span></div><div style="display:flex;gap:8px;margin-top:12px"><button class="btn" data-edit-authority="${esc(item[meta.idField])}">查看 / 编辑</button>${authorityRegistryType==="characters"&&!item.deletedAt?`<button class="btn" data-manage-mounts="${esc(item.characterId)}">世界书挂载</button>`:""}</div></article>`).join("")}</div>`:`<div class="empty">暂无${meta.label}。可以新建，或从 SullyOS 全量备份迁移。</div>`}
+      </div>`, `<button class="btn primary" id="createAuthorityEntity">新增${meta.label}</button>`);
+      $("createAuthorityEntity").onclick = () => openAuthorityEditor(authorityRegistryType);
+      document.querySelectorAll("[data-authority-type]").forEach(button => button.onclick = () => {
+        authorityRegistryType = button.dataset.authorityType;
+        localStorage.setItem("memoryHub.authorityRegistryType",authorityRegistryType);
+        authorityRegistryItems = [];
+        authorityRegistryLoadedType = "";
+        renderAuthorityRegistry();
+      });
+      document.querySelectorAll("[data-edit-authority]").forEach(button => button.onclick = () => {
+        const item = authorityRegistryItems.find(entry => String(entry[meta.idField]) === button.dataset.editAuthority);
+        if (item) openAuthorityEditor(authorityRegistryType,item);
+      });
+      document.querySelectorAll("[data-manage-mounts]").forEach(button => button.onclick = () => {
+        const item = authorityRegistryItems.find(entry => String(entry.characterId) === button.dataset.manageMounts);
+        if (item) void openMountManager(item);
+      });
+    }
+
+    async function loadIndependentChat(force=false) {
+      if (!activeChar || (independentChatState.loading && independentChatState.charId === activeChar && independentChatState.surface === independentChatSurface)) return;
+      if (!force && independentChatState.charId === activeChar && independentChatState.surface === independentChatSurface) return;
+      const targetChar = activeChar;
+      const targetSurface = independentChatSurface;
+      const targetVisibility = targetSurface === "chat" ? "user" : "internal";
+      independentChatState = { charId:targetChar, surface:targetSurface, messages:[], events:[], snapshot:null, surfaceCounts:{}, eventSurfaceCounts:{}, loading:true, sending:false, error:"" };
+      if (view === "independentChat") renderIndependentChat();
+      try {
+        const snapshotResult = await api(`/v1/characters/${encodeURIComponent(targetChar)}/snapshot`);
+        const [messagesResult, eventsResult] = await Promise.all([
+          api(`/api/runtime/messages?charId=${encodeURIComponent(targetChar)}&surface=${encodeURIComponent(targetSurface)}&visibility=${encodeURIComponent(targetVisibility)}&limit=200`),
+          api(`/v1/events?after=0&characterId=${encodeURIComponent(targetChar)}&surface=${encodeURIComponent(targetSurface)}&visibility=${encodeURIComponent(targetVisibility)}&clientId=hub-admin-ui&limit=200`),
+        ]);
+        if (targetChar !== activeChar) return;
+        independentChatState = {
+          charId:targetChar,
+          surface:targetSurface,
+          messages:(messagesResult.messages || []).slice().sort((a,b)=>Number(a.id||0)-Number(b.id||0)),
+          events:eventsResult.events || [],
+          snapshot:snapshotResult.snapshot || null,
+          surfaceCounts:messagesResult.surfaceCounts || {},
+          eventSurfaceCounts:eventsResult.surfaceCounts || {},
+          loading:false,
+          sending:false,
+          error:"",
+        };
+      } catch (error) {
+        if (targetChar !== activeChar) return;
+        independentChatState = { ...independentChatState, loading:false, sending:false, error:error?.message || String(error) };
+      }
+      if (view === "independentChat") renderIndependentChat();
+    }
+
+    function independentChatTime(value) {
+      const time = Number(value) || Date.parse(value || "");
+      return Number.isFinite(time) && time > 0 ? new Date(time).toLocaleString() : "";
+    }
+
+    function renderIndependentChat() {
+      if (!hasRoleScope()) return renderRoleGate("独立聊天", "先选择一个 TA，再让 Hub 独立组装和运行聊天。" );
+      const current = char();
+      const stale = independentChatState.charId !== activeChar || independentChatState.surface !== independentChatSurface;
+      if (stale) queueMicrotask(() => void loadIndependentChat());
+      const state = stale ? { ...independentChatState, messages:[], events:[], snapshot:null, surfaceCounts:{}, eventSurfaceCounts:{} } : independentChatState;
+      const messages = state.messages || [];
+      const snapshot = state.snapshot;
+      const events = state.events || [];
+      const surfaceLabels = { chat:"对话", activity:"彼方活动", world:"世界", state:"状态", memory:"记忆", schedule:"日程", system:"系统" };
+      const currentSurfaceLabel = surfaceLabels[independentChatSurface] || independentChatSurface;
+      const surfaceTabs = Object.entries(surfaceLabels).map(([key,label])=>`<button type="button" class="chip hub-zone-tab ${key===independentChatSurface?"active":""}" data-hub-zone="${key}">${label} ${Number(state.surfaceCounts?.[key]||0)}</button>`).join("");
+      const charOptions = data.characters.map(item=>`<option value="${esc(item.id)}" ${item.id===activeChar?"selected":""}>${esc(item.name||item.id)}</option>`).join("");
+      const messageHtml = messages.length ? messages.map(message => {
+        const role = message.role === "user" ? "user" : message.role === "system" ? "system" : "assistant";
+        const roleLabel = role === "user" ? "User" : role === "system" ? "System" : (current?.name || "Assistant");
+        const authority = message.metadata?.authority === "memory-hub" || String(message.sourceId||"").includes(":assistant") ? "Hub 权威" : "Hub 运行库";
+        return `<div class="hub-chat-bubble ${role}"><p>${esc(message.content||"")}</p><small>${esc(roleLabel)} · ${esc(authority)}${independentChatTime(message.timestamp)?` · ${esc(independentChatTime(message.timestamp))}`:""}</small></div>`;
+      }).join("") : `<div class="empty">${independentChatSurface === "chat" ? "还没有聊天记录。Hub 会在这里独立组装 Context、调用模型并保存双方消息。" : `${esc(currentSurfaceLabel)}区域暂无记录。`}</div>`;
+      const recentEvents = events.slice(-8).reverse();
+      const sideEvents = recentEvents.length ? recentEvents.map(event=>`<div class="hub-chat-event"><b>#${event.eventId} · ${esc(event.type)}</b><span>${esc(independentChatTime(event.occurredAt))}</span></div>`).join("") : `<div class="empty">暂无角色事件。</div>`;
+      const zoneCounts = state.eventSurfaceCounts || {};
+      const zoneSummary = Object.entries(surfaceLabels).map(([key,label])=>`<span class="chip">${label} ${Number(zoneCounts[key]||0)}</span>`).join(" ");
+      const status = state.error
+        ? `<div class="safety"><b>Hub 运行失败</b>${esc(state.error)}<br>请确认该角色已经迁移到权威档案，并配置聊天模型。</div>`
+        : `<div class="safety ok"><b>独立运行</b>本页直接调用 Memory Hub；不改写 SullyOS，也不要求 SullyOS 在线。</div>`;
+      $("mainPanel").innerHTML = panel("独立聊天", "Hub 自己组装、运行、保存与回放", `<div class="content-scroll">
+        ${status}<br>
+        <div class="hub-chat-shell">
+          <section class="hub-chat-main">
+            <div class="hub-chat-head"><div><h3>${esc(current?.name || activeChar)} · ${esc(currentSurfaceLabel)}</h3><p>charId: ${esc(activeChar)} · 当前区域 ${messages.length} 条；不同区域不会混入普通聊天历史</p></div><label class="scope-select">切换 TA <select id="hubChatChar">${charOptions}</select></label></div>
+            <div class="hub-zone-tabs">${surfaceTabs}</div>
+            <div class="hub-chat-log" id="hubChatLog">${state.loading?`<div class="empty">正在读取 Hub 运行状态…</div>`:messageHtml}</div>
+            ${independentChatSurface === "chat" ? `<form class="hub-chat-compose" id="hubChatForm"><textarea id="hubChatInput" placeholder="直接和 Hub 中独立运行的 TA 聊天…" ${state.sending?"disabled":""}></textarea><button class="btn primary" type="submit" ${state.sending||state.loading?"disabled":""}>${state.sending?"运行中…":"发送给 Hub"}</button></form>` : `<div class="hub-chat-compose"><div class="safety ok"><b>${esc(currentSurfaceLabel)}只读区域</b>这里用于查看角色后台活动和状态，不会作为聊天气泡发送。</div></div>`}
+          </section>
+          <aside class="hub-chat-side">
+            <div class="detail-card"><div class="memory-top"><h3>角色快照</h3><span class="chip">v${snapshot?.snapshotVersion||0}</span></div><p>最后事件 #${snapshot?.lastEventId||0}<br>快照消息 ${(snapshot?.recentMessages||[]).length} 条</p><button class="btn" id="hubChatSnapshot" ${snapshot?"":"disabled"}>查看快照</button></div>
+            <div class="detail-card"><div class="memory-top"><h3>区域隔离</h3><span class="chip">Hub-only</span></div><p style="line-height:2">${zoneSummary}</p><small>聊天上下文只读取“对话”；彼方活动、世界、状态、记忆、日程和系统事件不会进入聊天记录。</small></div>
+            <div class="detail-card"><div class="memory-top"><h3>Context</h3><span class="chip">Sully parity</span></div><p>预览最终 System Prompt、激活世界书、召回结果和消息数组。</p><button class="btn" id="hubChatPreview">组装预览</button></div>
+            <div class="detail-card"><div class="memory-top"><h3>${esc(currentSurfaceLabel)}事件</h3><span class="chip">${events.length}</span></div><div style="display:flex;flex-direction:column;gap:7px;margin:9px 0">${sideEvents}</div><button class="btn" id="hubChatEvents">查看${esc(currentSurfaceLabel)}事件</button></div>
+            <button class="btn" id="hubChatRefresh" ${state.loading?"disabled":""}>刷新运行状态</button>
+          </aside>
+        </div>
+      </div>`);
+      $("hubChatChar").onchange = event => setView("independentChat", { charId:event.target.value });
+      document.querySelectorAll("[data-hub-zone]").forEach(button => button.onclick = () => {
+        independentChatSurface = button.dataset.hubZone;
+        localStorage.setItem("memoryHub.independentChatSurface", independentChatSurface);
+        void loadIndependentChat(true);
+      });
+      $("hubChatRefresh").onclick = () => void loadIndependentChat(true);
+      $("hubChatPreview").onclick = async () => {
+        try {
+          toast("正在由 Hub 组装最终 Context…");
+          const result = await api("/api/v1/context/assemble", { method:"POST", body:JSON.stringify({ characterId:activeChar }) });
+          $("infoTitle").textContent = `${current?.name || activeChar} · Hub Context 预览`;
+          $("infoBody").innerHTML = `<div class="safety ok"><b>最终组装</b>世界书 ${(result.activatedWorldbooks||[]).length} · 召回 ${(result.recallResult?.items||[]).length} · 消息 ${(result.finalMessages||[]).length}</div><br><details open><summary>最终 System Prompt</summary><pre style="white-space:pre-wrap;word-break:break-word">${esc(result.finalSystemPrompt||"")}</pre></details><br><details><summary>激活世界书</summary><pre style="white-space:pre-wrap;word-break:break-word">${esc(JSON.stringify(result.activatedWorldbooks||[],null,2))}</pre></details><br><details><summary>召回结果</summary><pre style="white-space:pre-wrap;word-break:break-word">${esc(JSON.stringify(result.recallResult||{},null,2))}</pre></details><br><details><summary>最终消息数组</summary><pre style="white-space:pre-wrap;word-break:break-word">${esc(JSON.stringify(result.finalMessages||[],null,2))}</pre></details>`;
+          openModal("infoModal");
+        } catch (error) { toast(`Context 组装失败：${error?.message || error}`); }
+      };
+      $("hubChatSnapshot").onclick = () => {
+        const foldedSnapshot = foldAuthorityMedia(snapshot);
+        const snapshotPreview = { ...foldedSnapshot.data, recentMessages:(foldedSnapshot.data?.recentMessages||[]).slice(-20) };
+        $("infoTitle").textContent = `${current?.name || activeChar} · 角色快照`;
+        $("infoBody").innerHTML = `<div class="safety"><b>管理预览</b>这里只显示最近 20 条消息，媒体字段已折叠；完整快照仍保存在 authority.sqlite。</div><br>${authorityMediaPreview(foldedSnapshot.entries)}<pre style="white-space:pre-wrap;word-break:break-word">${esc(JSON.stringify(snapshotPreview,null,2))}</pre>`;
+        openModal("infoModal");
+      };
+      $("hubChatEvents").onclick = () => {
+        $("infoTitle").textContent = `${current?.name || activeChar} · 事件流`;
+        $("infoBody").innerHTML = `<pre style="white-space:pre-wrap;word-break:break-word">${esc(JSON.stringify(events,null,2))}</pre>`;
+        openModal("infoModal");
+      };
+      if ($("hubChatForm")) $("hubChatForm").onsubmit = async event => {
+        event.preventDefault();
+        const input = $("hubChatInput");
+        const content = input.value.trim();
+        if (!content || independentChatState.sending) return;
+        independentChatState = { ...independentChatState, sending:true, error:"" };
+        renderIndependentChat();
+        try {
+          const now = Date.now();
+          await api("/v1/chat/turns", { method:"POST", body:JSON.stringify({ commandId:`hub-ui-${now}-${Math.random().toString(36).slice(2,9)}`, characterId:activeChar, actorId:"hub-admin-ui", userId:"me", conversationId:`direct:me:${activeChar}`, content, message:{ sourceId:`hub-ui-user-${now}`, role:"user", type:"text", content, timestamp:now, surface:"chat", visibility:"user", conversationId:`direct:me:${activeChar}`, origin:"user" } }) });
+          independentChatState.sending = false;
+          await loadIndependentChat(true);
+          toast("Hub 回合已完成并写入事件日志。" );
+        } catch (error) {
+          independentChatState = { ...independentChatState, sending:false, error:error?.message || String(error) };
+          renderIndependentChat();
+        }
+      };
+      const log = $("hubChatLog");
+      if (log) log.scrollTop = log.scrollHeight;
+    }
+
+    async function loadContextAssembly(force=false) {
+      if (!activeChar || contextAssemblyState.loading) return;
+      if (!force && contextAssemblyState.charId === activeChar && contextAssemblyState.result) return;
+      const targetChar = activeChar;
+      contextAssemblyState = { ...contextAssemblyState, charId:targetChar, loading:true, error:"" };
+      if (view === "contextAssembly") renderContextAssembly();
+      try {
+        const result = await api("/api/v1/context/assemble", { method:"POST", body:JSON.stringify({ characterId:targetChar, query:contextAssemblyState.query || undefined }) });
+        if (targetChar !== activeChar) return;
+        contextAssemblyState = { ...contextAssemblyState, charId:targetChar, result, loading:false, error:"" };
+      } catch (error) {
+        if (targetChar !== activeChar) return;
+        contextAssemblyState = { ...contextAssemblyState, loading:false, error:error?.message || String(error) };
+      }
+      if (view === "contextAssembly") renderContextAssembly();
+    }
+
+    function contextTextStats(text) {
+      const value = String(text || "");
+      return `${value.length.toLocaleString()} 字符 · ${value ? value.split(/\r?\n/).length : 0} 行`;
+    }
+
+    function contextDiff(left, right) {
+      const a = String(left || ""), b = String(right || "");
+      if (!b) return { status:"empty", firstDiff:-1, same:false, label:"等待粘贴 SullyOS 预览文本" };
+      if (a === b) return { status:"same", firstDiff:-1, same:true, label:`完全一致 · ${a.length.toLocaleString()} 字符` };
+      let index = 0;
+      while (index < a.length && index < b.length && a[index] === b[index]) index += 1;
+      const line = a.slice(0,index).split("\n").length;
+      const column = index - a.lastIndexOf("\n", Math.max(0,index-1));
+      return { status:"different", firstDiff:index, same:false, label:`存在差异 · 首个差异在第 ${line} 行、第 ${column} 列 · Hub ${a.length} / SullyOS ${b.length} 字符` };
+    }
+
+    function openContextSource(target) {
+      if (["characters","users","worldbooks"].includes(target)) {
+        authorityRegistryType = target;
+        localStorage.setItem("memoryHub.authorityRegistryType", target);
+        authorityRegistryLoadedType = "";
+        return setView("authorityRegistry");
+      }
+      if (target) setView(target);
+    }
+
+    function renderContextAssembly() {
+      if (!hasRoleScope()) return renderRoleGate("上下文组装", "先选择一个 TA，再由 Hub 组装角色的完整 Core Text。" );
+      const stale = contextAssemblyState.charId !== activeChar;
+      if (stale && !contextAssemblyState.loading) queueMicrotask(() => void loadContextAssembly(true));
+      const state = stale ? { ...contextAssemblyState, result:null, error:"" } : contextAssemblyState;
+      const result = state.result;
+      const blocks = result?.sourceBlocks || [];
+      const finalMessages = result?.finalMessages || [];
+      const diff = contextDiff(result?.finalSystemPrompt || "", state.sullyText || "");
+      const current = char();
+      const blockHtml = blocks.length ? blocks.map((block,index)=>`<details class="detail-card" ${index<3?"open":""} style="margin:0"><summary style="cursor:pointer"><span style="display:flex;align-items:center;justify-content:space-between;gap:12px"><b>${esc(block.title)}</b><span class="chip" style="color:${block.enabled?"var(--green)":"var(--muted)"}">${block.enabled?"已注入":"未启用"}</span></span></summary><p style="margin:8px 0;color:var(--muted)">${esc(block.source||"")}</p>${block.content?`<pre style="max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word">${esc(block.content)}</pre>`:`<div class="empty" style="padding:18px">当前没有内容</div>`}${block.editable?`<button class="btn" data-context-source="${esc(block.target||"")}" style="margin-top:10px">修改权威来源</button>`:""}</details>`).join("") : `<div class="empty">尚未取得来源块。</div>`;
+      const messageHtml = finalMessages.length ? finalMessages.map((message,index)=>`<details class="detail-card" style="margin:0"><summary style="cursor:pointer"><b>#${index+1} · ${esc(message.role||"unknown")}</b> <span class="chip">${contextTextStats(message.content||"")}</span></summary><pre style="max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word">${esc(message.content||"")}</pre></details>`).join("") : `<div class="empty">暂无最终消息数组。</div>`;
+      const error = state.error ? `<div class="safety"><b>组装失败</b>${esc(state.error)}</div><br>` : "";
+      const summary = result ? `<div class="card-grid" style="grid-template-columns:repeat(4,minmax(0,1fr))"><div class="card"><p>Stable System</p><h3>${contextTextStats(result.stableSystemPrompt)}</h3></div><div class="card"><p>Volatile</p><h3>${contextTextStats(result.volatileContext)}</h3></div><div class="card"><p>激活世界书</p><h3>${(result.activatedWorldbooks||[]).length} 条</h3></div><div class="card"><p>Recall</p><h3>${(result.recallResult?.items||[]).length} 条</h3></div></div>` : "";
+      $("mainPanel").innerHTML = panel("上下文组装", `${current?.name || activeChar} · Hub 实时 Core Text`, `<div class="content-scroll">
+        <div class="safety ok"><b>权威实时组装</b>最终文本不另存重复快照；修改人设、User、世界书或记忆后重新组装。SullyOS 对比文本仅保留在当前页面，不写入 Hub。</div><br>
+        ${error}
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px"><label style="flex:1;min-width:260px"><span style="display:block;margin-bottom:7px;color:var(--muted)">本轮 Recall 查询（留空则使用最近消息）</span><input id="contextAssemblyQuery" value="${esc(state.query||"")}" placeholder="输入当前话题，用于测试本轮召回" style="width:100%"></label><button class="btn primary" id="contextAssembleNow" ${state.loading?"disabled":""}>${state.loading?"正在组装…":"重新组装"}</button><button class="btn" id="contextCopyFinal" ${result?"":"disabled"}>复制最终 Core Text</button></div>
+        ${summary}
+        <div class="section-title"><div><h3>权威来源块</h3><p>编辑来源，最终文本会重新计算</p></div><span class="chip">${blocks.filter(item=>item.enabled).length} / ${blocks.length} 已启用</span></div>
+        <div class="card-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">${blockHtml}</div>
+        <div class="section-title"><div><h3>最终组装</h3><p>Stable 在历史消息前；Volatile 在历史消息后</p></div><span class="chip">${contextTextStats(result?.finalSystemPrompt||"")}</span></div>
+        <div class="card-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))"><section class="detail-card"><div class="memory-top"><h3>Stable System</h3><span class="chip">稳定层</span></div><pre style="height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word">${esc(result?.stableSystemPrompt||"")}</pre></section><section class="detail-card"><div class="memory-top"><h3>Volatile Context</h3><span class="chip">本轮层</span></div><pre style="height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word">${esc(result?.volatileContext||"")}</pre></section></div>
+        <div class="section-title"><div><h3>临时双栏对比</h3><p>右侧粘贴 SullyOS 同条件预览；关闭或刷新即丢弃</p></div><span class="chip" style="color:${diff.same?"var(--green)":diff.status==="different"?"var(--rose)":"var(--muted)"}">${esc(diff.label)}</span></div>
+        <div class="card-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))"><label class="detail-card"><b>Hub 最终 Core Text</b><textarea readonly style="width:100%;height:360px;margin-top:10px">${esc(result?.finalSystemPrompt||"")}</textarea></label><label class="detail-card"><b>SullyOS 预览文本（临时）</b><textarea id="contextSullyText" style="width:100%;height:360px;margin-top:10px" placeholder="把 SullyOS 同角色、同消息、同时间的最终 System Prompt 粘贴到这里…">${esc(state.sullyText||"")}</textarea><button class="btn" id="contextCompareNow" style="margin-top:10px">立即比较</button></label></div>
+        <div class="section-title"><div><h3>最终消息数组</h3><p>包含 System、历史消息、世界书 depth 注入和 Volatile</p></div><span class="chip">${finalMessages.length} 条</span></div>
+        <div style="display:flex;flex-direction:column;gap:10px">${messageHtml}</div>
+      </div>`);
+      $("contextAssembleNow").onclick = () => { contextAssemblyState.query = $("contextAssemblyQuery").value.trim(); void loadContextAssembly(true); };
+      $("contextCopyFinal").onclick = async () => { try { await navigator.clipboard.writeText(result?.finalSystemPrompt||""); toast("最终 Core Text 已复制。"); } catch { toast("复制失败，请手动选择文本。"); } };
+      $("contextCompareNow").onclick = () => { contextAssemblyState.sullyText = $("contextSullyText").value; renderContextAssembly(); };
+      document.querySelectorAll("[data-context-source]").forEach(button => button.onclick = () => openContextSource(button.dataset.contextSource));
+    }
+
+    function runtimeJobCard(job) {
+      const terminal = ["completed","cancelled","failed"].includes(job.status);
+      return `<article class="memory-item"><div class="memory-top"><div><b>${esc(job.jobType)}</b><p>${esc(job.jobId)}</p></div><span class="chip">${esc(job.status)}</span></div><p>计划：${esc(formatTime(job.dueAt))} · 尝试 ${Number(job.attemptCount||0)} 次</p>${job.lastError?`<p style="color:var(--rose)">${esc(job.lastError)}</p>`:""}<div class="card-meta"><span class="chip">${esc(job.characterId)}</span>${terminal?"":`<button class="btn" data-cancel-runtime-job="${esc(job.jobId)}">取消</button>`}</div></article>`;
+    }
+
+    function outboxDeliveryCard(delivery) {
+      return `<article class="memory-item"><div class="memory-top"><div><b>#${delivery.eventId} · ${esc(delivery.event?.type||"event")}</b><p>${esc(delivery.deliveryId)}</p></div><span class="chip">${esc(delivery.status)}</span></div><div class="card-meta"><span class="chip">尝试 ${Number(delivery.attemptCount||0)}</span><button class="btn primary" data-ack-delivery="${esc(delivery.deliveryId)}">ACK</button><button class="btn" data-retry-delivery="${esc(delivery.deliveryId)}">重试</button></div></article>`;
+    }
+
+    async function loadActionRuntime(force = false) {
+      if (!serverMode() || actionRuntimeState.loading) return;
+      if (!force && actionRuntimeState.loaded && actionRuntimeState.charId === activeChar) return;
+      actionRuntimeState = { ...actionRuntimeState, charId:activeChar, loaded:false, loading:true, error:"" };
+      try {
+        const suffix = activeChar ? `?characterId=${encodeURIComponent(activeChar)}&limit=100` : "?limit=100";
+        const result = await api(`/v1/scheduled-jobs${suffix}`);
+        actionRuntimeState = { ...actionRuntimeState, charId:activeChar, jobs:result.jobs||[], loaded:true, loading:false };
+      } catch (error) {
+        actionRuntimeState = { ...actionRuntimeState, loaded:true, loading:false, error:error?.message||String(error) };
+      }
+      if (view === "runtimeCenter") renderRuntimeCenter();
+    }
+
+    async function createRuntimeJob() {
+      if (!activeChar) return toast("先选择一个 TA。");
+      try {
+        const stateRaw = $("runtimeJobState").value.trim();
+        const statePatch = stateRaw ? JSON.parse(stateRaw) : {};
+        const content = $("runtimeJobMessage").value.trim();
+        const localDue = $("runtimeJobDue").value;
+        const dueAt = localDue ? new Date(localDue).toISOString() : new Date(Date.now()+60000).toISOString();
+        await api("/v1/scheduled-jobs", { method:"POST", body:JSON.stringify({ characterId:activeChar, jobType:$("runtimeJobType").value, dueAt, payload:{ statePatch, ...(content?{ message:{ content } }: {}) } }) });
+        toast("定时任务已写入 Hub。" );
+        actionRuntimeState.loaded = false;
+        await loadActionRuntime(true);
+      } catch (error) { toast(`创建任务失败：${error?.message||error}`); }
+    }
+
+    async function cancelRuntimeJob(jobId) {
+      try {
+        await api(`/v1/scheduled-jobs/${encodeURIComponent(jobId)}`, { method:"DELETE" });
+        toast("任务已取消。" );
+        await loadActionRuntime(true);
+      } catch (error) { toast(`取消失败：${error?.message||error}`); }
+    }
+
+    async function runActionTick() {
+      try {
+        const result = await api("/v1/runtime/tick", { method:"POST", body:JSON.stringify({ limit:20 }) });
+        toast(`运行时检查完成：领取 ${result.claimed||0} 个任务。`);
+        contractStatus = null;
+        await Promise.all([loadActionRuntime(true), loadContractStatus(true)]);
+      } catch (error) { toast(`运行时检查失败：${error?.message||error}`); }
+    }
+
+    async function pullRuntimeOutbox() {
+      const clientId = $("outboxClientId").value.trim() || "hub-admin-ui";
+      const after = Math.max(0, Number(authorityStats?.eventStore?.events||0)-100);
+      try {
+        const result = await api(`/v1/outbox?clientId=${encodeURIComponent(clientId)}&after=${after}&limit=100`);
+        actionRuntimeState = { ...actionRuntimeState, clientId, deliveries:result.deliveries||[] };
+        renderRuntimeCenter();
+      } catch (error) { toast(`Outbox 拉取失败：${error?.message||error}`); }
+    }
+
+    async function settleRuntimeDelivery(deliveryId, action) {
+      try {
+        const result = await api(`/v1/outbox/${encodeURIComponent(deliveryId)}/${action}`, { method:"POST", body:JSON.stringify({ clientId:actionRuntimeState.clientId, ...(action==="retry"?{ error:"manual retry" }: {}) }) });
+        actionRuntimeState.deliveries = actionRuntimeState.deliveries.map(item => item.deliveryId===deliveryId ? { ...item, ...result.delivery } : item);
+        renderRuntimeCenter();
+      } catch (error) { toast(`Outbox 操作失败：${error?.message||error}`); }
+    }
+
+    function renderRuntimeCenter() {
+      if (!serverMode()) {
+        $("mainPanel").innerHTML = panel("运行中心", "Memory Hub 服务端协议与角色运行阶段", `<div class="content-scroll"><div class="empty">请通过 npm start 启动 Memory Hub 后查看运行中心。</div></div>`);
+        return;
+      }
+      if (!contractStatus && !contractStatusLoading) void loadContractStatus();
+      if (!contractStatus || contractStatusLoading) {
+        $("mainPanel").innerHTML = panel("运行中心", "正在读取服务端协议", `<div class="content-scroll"><div class="empty">正在加载 hub-contract…</div></div>`);
+        return;
+      }
+      if (contractStatus.error) {
+        $("mainPanel").innerHTML = panel("运行中心", "协议状态读取失败", `<div class="content-scroll"><div class="safety"><b>无法读取</b>${esc(contractStatus.error)}</div><br><button class="btn" id="retryContracts">重试</button></div>`);
+        $("retryContracts").onclick = () => { contractStatus = null; void loadContractStatus(true); };
+        return;
+      }
+      const contract = contractStatus.contract || {};
+      const runtime = contractStatus.runtime || {};
+      const implemented = contractStatus.capabilities?.implemented || [];
+      const planned = contractStatus.capabilities?.planned || [];
+      const schemas = contract.schemas || [];
+      const entityStats = authorityStats?.entities || {};
+      const runtimeStats = authorityStats?.runtime || {};
+      const archiveStats = authorityStats?.archives || {};
+      const eventStats = authorityStats?.eventStore || {};
+      const preview = migrationPreview;
+      if ((!actionRuntimeState.loaded || actionRuntimeState.charId !== activeChar) && !actionRuntimeState.loading) void loadActionRuntime();
+      $("mainPanel").innerHTML = panel("运行中心", "Hub 从记忆后端升级为角色权威服务器的管理入口", `<div class="content-scroll">
+        <div class="stat-grid">
+          <div class="stat-box"><span>协议版本</span><b>${esc(contract.protocolVersion || "-")}</b></div>
+          <div class="stat-box"><span>契约包</span><b>${esc(contract.packageVersion || "-")}</b></div>
+          <div class="stat-box"><span>当前权威</span><b>${runtime.authority === "hybrid-transition" ? "Hub 权威层过渡期" : esc(runtime.authority || "-")}</b></div>
+          <div class="stat-box"><span>持久化</span><b>${esc(runtime.persistence || "-")}</b></div>
+        </div>
+        <br>
+        <div class="safety ok"><b>统一运行中心</b>人设、User、世界书、记忆、EventBox、消息与角色运行状态仅由 authority.sqlite 持久化。与 SullyOS 的对比按需临时拉取，关闭预览即丢弃。</div>
+        <br>
+        <div class="detail-card">
+          <div class="memory-top"><h3>权威实体</h3><span class="chip">SQLite</span></div>
+          <div class="stat-grid">
+            <div class="stat-box"><span>角色</span><b>${entityStats.character?.count || 0}</b></div>
+            <div class="stat-box"><span>User</span><b>${entityStats.userProfile?.count || 0}</b></div>
+            <div class="stat-box"><span>世界书</span><b>${entityStats.worldbook?.count || 0}</b></div>
+            <div class="stat-box"><span>世界</span><b>${entityStats.world?.count || 0}</b></div>
+          </div>
+          <div class="card-meta"><span class="chip">墓碑 ${Object.values(entityStats).reduce((sum,item)=>sum+Number(item?.deleted||0),0)}</span><span class="chip">迁移 ${authorityStats?.migrations || 0} 次</span></div>
+        </div>
+        <br>
+        <div class="detail-card">
+          <div class="memory-top"><div><h3>SullyOS 全量迁移</h3><p>先预检，确认报告后才写入；用于首次迁移和灾难恢复。</p></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="chooseMigration" ${migrationBusy?"disabled":""}>${migrationBusy?"处理中…":"选择全量 JSON 备份"}</button>${pendingMigrationBackup?`<button class="btn primary" id="commitMigration" ${migrationBusy?"disabled":""}>确认写入 Hub</button>`:""}</div></div>
+          ${preview ? preview.error
+            ? `<div class="safety"><b>预检/迁移失败</b>${esc(preview.error)}</div>`
+            : `<div class="safety ok"><b>${pendingMigrationBackup?"预检完成 · 尚未写入":"最近迁移结果"}</b>${esc(preview.fileName || preview.migrationId || "")} ${preview.fileBytes?`· ${(preview.fileBytes/1048576).toFixed(1)} MB`:""}</div><br>
+               <h4>源对象</h4>${migrationCountRows(preview.sourceCounts)}<br>
+               <h4>导入对象</h4>${migrationCountRows(preview.importedCounts)}<br>
+               <div class="card-meta"><span class="chip">跳过 ${Object.values(preview.skippedCounts||{}).reduce((s,v)=>s+Number(v||0),0)}</span><span class="chip">缺失引用 ${(preview.missingReferences||[]).length}</span><span class="chip">不支持字段 ${(preview.unsupportedFields||[]).length}</span><span class="chip">哈希差异 ${(preview.hashDifferences||[]).length}</span></div>
+               ${(preview.unsupportedFields||[]).length?`<p>不导入：${esc(preview.unsupportedFields.join("、"))}</p>`:""}
+               ${(preview.missingReferences||[]).length?`<details><summary>查看缺失引用</summary><pre style="white-space:pre-wrap;word-break:break-word">${esc(JSON.stringify(preview.missingReferences.slice(0,100),null,2))}</pre></details>`:""}`
+            : `<div class="empty">尚未选择全量备份。此入口与原来的“导入记忆宫殿 JSON”分开。</div>`}
+        </div>
+        <br>
+        <div class="detail-card"><div class="memory-top"><h3>正式运行域</h3><span class="chip">${Object.values(runtimeStats).reduce((sum,value)=>sum+Number(value||0),0)} 对象</span></div>${migrationCountRows(runtimeStats)}</div>
+        <br>
+        <div class="detail-card">
+          <div class="memory-top"><div><h3>行动运行时</h3><p>定时器只唤醒 Hub；角色可用性、状态变更、主动消息和快照都在服务端完成。</p></div><button class="btn" id="runActionTick">立即检查到期任务</button></div>
+          <div class="stat-grid">
+            <div class="stat-box"><span>Commands</span><b>${eventStats.commands||0}</b></div>
+            <div class="stat-box"><span>Events</span><b>${eventStats.events||0}</b></div>
+            <div class="stat-box"><span>角色快照</span><b>${eventStats.snapshots||0}</b></div>
+            <div class="stat-box"><span>Outbox</span><b>${eventStats.outboxDeliveries||0}</b></div>
+          </div>
+          <br>
+          <div class="field-grid">
+            <label><span>任务类型</span><select id="runtimeJobType"><option value="character.action">角色行动</option><option value="message.notify">主动消息</option><option value="state.patch">状态更新</option></select></label>
+            <label><span>执行时间</span><input id="runtimeJobDue" type="datetime-local"></label>
+          </div>
+          <label><span>消息内容（可空）</span><textarea id="runtimeJobMessage" rows="2" placeholder="由 Hub 在到期后写入角色主动消息；这里不调用模型。"></textarea></label>
+          <label><span>状态 Patch JSON（可空）</span><textarea id="runtimeJobState" rows="3" placeholder='{"mood":"calm","activity":{"name":"reading"}}'></textarea></label>
+          <div class="card-meta"><button class="btn primary" id="createRuntimeJob" ${activeChar?"":"disabled"}>为当前 TA 建立任务</button><span class="chip">当前 TA：${esc(char()?.name||"未选择")}</span><span class="chip">任务 ${actionRuntimeState.jobs.length}</span></div>
+          ${actionRuntimeState.error?`<br><div class="safety"><b>运行时读取失败</b>${esc(actionRuntimeState.error)}</div>`:""}
+          <br><div class="memory-list">${actionRuntimeState.loading?`<div class="empty">正在读取任务…</div>`:actionRuntimeState.jobs.length?actionRuntimeState.jobs.slice(0,20).map(runtimeJobCard).join(""):`<div class="empty">暂无定时任务。</div>`}</div>
+        </div>
+        <br>
+        <div class="detail-card">
+          <div class="memory-top"><div><h3>可靠 Outbox</h3><p>按客户端独立投递 Event；只有 ACK 后才推进该客户端游标。</p></div><button class="btn" id="pullOutbox">拉取待投递事件</button></div>
+          <label><span>客户端 ID</span><input id="outboxClientId" value="${esc(actionRuntimeState.clientId)}"></label>
+          <div class="memory-list">${actionRuntimeState.deliveries.length?actionRuntimeState.deliveries.slice(0,30).map(outboxDeliveryCard).join(""):`<div class="empty">尚未拉取 Outbox。</div>`}</div>
+        </div>
+        ${Object.values(archiveStats).some((value)=>Number(value||0)>0)?`<br><div class="detail-card"><div class="memory-top"><h3>待提升的旧迁移对象</h3><span class="chip">${Object.values(archiveStats).reduce((sum,value)=>sum+Number(value||0),0)} 对象</span></div>${migrationCountRows(archiveStats)}</div>`:""}
+        <br>
+        <div class="detail-card"><div class="memory-top"><h3>迁移历史</h3><span class="chip">${migrationReports.length}</span></div><div class="memory-list">${migrationReports.length?migrationReports.map(migrationReportCard).join(""):`<div class="empty">暂无迁移报告。</div>`}</div></div>
+        <br>
+        <div class="detail-card">
+          <div class="memory-top"><h3>共享数据契约</h3><span class="chip">${schemas.length} 类</span></div>
+          <p>这些契约是 SullyOS 与 Hub 的共同通信格式。普通管理不需要编辑 Schema；点击仅用于开发诊断。</p>
+          <div class="card-grid">${schemas.map(item => `<button class="card" data-contract-schema="${esc(item.name)}"><h3>${esc(item.title || item.name)}</h3><p>${esc(item.name)}</p><div class="card-meta"><span class="chip">查看 Schema</span></div></button>`).join("")}</div>
+        </div>
+        <br>
+        <div class="card-grid">
+          <div class="detail-card"><div class="memory-top"><h3>已接通能力</h3><span class="chip" style="color:var(--green)">${implemented.length}</span></div><div class="memory-list">${runtimeCapabilityRows(implemented, "implemented")}</div></div>
+          <div class="detail-card"><div class="memory-top"><h3>下一阶段</h3><span class="chip" style="color:var(--amber)">${planned.length}</span></div><div class="memory-list">${runtimeCapabilityRows(planned, "planned")}</div></div>
+        </div>
+        <br>
+        <div class="detail-card">
+          <h3>以后在这里管理什么</h3>
+          <div class="card-meta"><span class="chip">角色运行状态</span><span class="chip">连接客户端</span><span class="chip">事件游标</span><span class="chip">冲突队列</span><span class="chip">定时行动</span><span class="chip">迁移报告</span></div>
+          <p>这些面板会在对应后端实体完成后逐项启用。目前不会提供能点击但不生效的假按钮。</p>
+        </div>
+      </div>`, `<button class="btn" id="assembleCurrentContext" ${activeChar?"":"disabled"}>组装当前 TA Context</button><button class="btn" id="refreshContracts">刷新</button>`);
+      $("refreshContracts").onclick = () => void loadContractStatus(true);
+      $("runActionTick").onclick = runActionTick;
+      $("createRuntimeJob").onclick = createRuntimeJob;
+      $("pullOutbox").onclick = pullRuntimeOutbox;
+      document.querySelectorAll("[data-cancel-runtime-job]").forEach(button => button.onclick = () => cancelRuntimeJob(button.dataset.cancelRuntimeJob));
+      document.querySelectorAll("[data-ack-delivery]").forEach(button => button.onclick = () => settleRuntimeDelivery(button.dataset.ackDelivery, "ack"));
+      document.querySelectorAll("[data-retry-delivery]").forEach(button => button.onclick = () => settleRuntimeDelivery(button.dataset.retryDelivery, "retry"));
+      if ($("assembleCurrentContext")) $("assembleCurrentContext").onclick = async () => {
+        if (!activeChar) return toast("请先在 TA 索引选择角色。");
+        try {
+          toast("正在由 Hub 组装最终 Context…");
+          const result = await api("/api/v1/context/assemble", { method:"POST", body:JSON.stringify({ characterId:activeChar }) });
+          $("infoTitle").textContent = `${data.characters.find(item=>item.id===activeChar)?.name || activeChar} · 最终 Context`;
+          $("infoBody").innerHTML = `<div class="safety ok"><b>组装来源</b>Memory Hub 单一权威运行库 · 激活世界书 ${(result.activatedWorldbooks||[]).length} · 召回 ${(result.recallResult?.items||[]).length} · 消息 ${(result.finalMessages||[]).length}</div><br><details open><summary>最终 System Prompt</summary><pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.55">${esc(result.finalSystemPrompt||"")}</pre></details><br><details><summary>稳定层</summary><pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.55">${esc(result.stableSystemPrompt||"")}</pre></details><br><details><summary>实时层</summary><pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.55">${esc(result.volatileContext||"")}</pre></details><br><details><summary>世界书激活列表</summary><pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.55">${esc(JSON.stringify(result.activatedWorldbooks||[],null,2))}</pre></details><br><details><summary>最终消息数组</summary><pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.55">${esc(JSON.stringify(result.finalMessages||[],null,2))}</pre></details>`;
+          openModal("infoModal");
+        } catch (error) { toast(`Context 组装失败：${error?.message || error}`); }
+      };
+      $("chooseMigration").onclick = () => $("migrationFile").click();
+      if ($("commitMigration")) $("commitMigration").onclick = commitMigration;
+      document.querySelectorAll("[data-contract-schema]").forEach(button => {
+        button.onclick = async () => {
+          try {
+            const result = await api(`/api/contracts/schemas/${encodeURIComponent(button.dataset.contractSchema)}`);
+            $("infoTitle").textContent = result.schema?.title || button.dataset.contractSchema;
+            $("infoBody").innerHTML = `<pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.55">${esc(JSON.stringify(result.schema, null, 2))}</pre>`;
+            openModal("infoModal");
+          } catch (error) {
+            toast(`Schema 读取失败：${error?.message || error}`);
+          }
+        };
+      });
     }
     function renderMapPanel() {
       const c = char();
@@ -6766,6 +7510,22 @@
         grouped.set(month, list);
       });
       const months = [...new Set([...grouped.keys(), ...Object.keys(refined)])].sort((a, b) => b.localeCompare(a));
+      const recallableMonths = months.filter(month => (grouped.get(month) || []).length > 0);
+      const currentMonth = new Date().toISOString().slice(0, 7);
+      const recallStorageKey = `memoryHub.legacyRecallMonth.${activeChar}`;
+      const savedRecallMonth = localStorage.getItem(recallStorageKey) || "";
+      const selectedRecallMonth = recallableMonths.includes(savedRecallMonth)
+        ? savedRecallMonth
+        : recallableMonths.includes(currentMonth) ? currentMonth : (recallableMonths[0] || "");
+      const recallMonthOptions = months.map(month => {
+        const fragmentCount = (grouped.get(month) || []).length;
+        const summaryOnly = fragmentCount === 0;
+        const active = activeMonths.has(month);
+        const label = summaryOnly
+          ? `${month} · 仅月度总结，无详细记录`
+          : `${month} · ${fragmentCount} 条详细记录${active ? " · 已激活" : ""}`;
+        return `<option value="${esc(month)}" ${month === selectedRecallMonth ? "selected" : ""} ${summaryOnly ? "disabled" : ""}>${esc(label)}</option>`;
+      }).join("");
       const fragmentTotal = [...grouped.values()].reduce((sum, list) => sum + list.length, 0);
       const templateId = localStorage.getItem("memoryHub.legacyTemplate") || "refine_atmosphere";
       const monthRows = months.map(month => {
@@ -6797,8 +7557,10 @@
                 <option value="refine_atmosphere" ${templateId === "refine_atmosphere" ? "selected" : ""}>氛围月记</option>
                 <option value="refine_keypoints" ${templateId === "refine_keypoints" ? "selected" : ""}>要点速记</option>
               </select>
-              <input class="legacy-recall-input" id="legacyRecallInput" value="${esc(months[0] ? `[[RECALL: ${months[0]}]]` : "")}" placeholder="[[RECALL: YYYY-MM]]">
-              <button class="btn small" id="legacyRecallRun">运行 RECALL</button>
+              <select class="legacy-recall-input" id="legacyRecallMonth" aria-label="选择要召回的记录月份" title="当前月没有记录时，自动选择最近一个有详细记录的月份" ${recallableMonths.length ? "" : "disabled"}>
+                ${recallMonthOptions || `<option value="">暂无可召回的详细记录</option>`}
+              </select>
+              <button class="btn small" id="legacyRecallRun" ${recallableMonths.length ? "" : "disabled"}>召回所选月份</button>
               <button class="btn small" id="legacyContextPreview">查看注入文本</button>
             </div>
           </div>
@@ -6812,6 +7574,7 @@
       </div>`, "", true);
       $("backBtn").onclick = () => setView("rooms");
       $("legacyTemplate").onchange = event => localStorage.setItem("memoryHub.legacyTemplate", event.target.value);
+      $("legacyRecallMonth").onchange = event => localStorage.setItem(recallStorageKey, event.target.value);
       document.querySelectorAll("[data-legacy-refine]").forEach(button => button.onclick = async () => {
         const month = button.dataset.legacyRefine;
         button.disabled = true;
@@ -6834,10 +7597,10 @@
         } catch (error) { toast(`月份状态更新失败：${error?.message || error}`); }
       });
       $("legacyRecallRun").onclick = async () => {
-        const text = $("legacyRecallInput").value.trim();
-        if (!text) return toast("请输入 [[RECALL: YYYY-MM]]。");
+        const month = $("legacyRecallMonth").value.trim();
+        if (!month) return toast("当前没有可召回的详细记录月份。");
         try {
-          const result = await api("/api/legacy/recall", { method:"POST", body:JSON.stringify({ charId:activeChar, text }) });
+          const result = await api("/api/legacy/recall", { method:"POST", body:JSON.stringify({ charId:activeChar, month }) });
           toast(result.alreadyActive ? `${result.yearMonth} 已经处于激活状态。` : `${result.yearMonth} 已调出 ${String(result.logsText || "").split("\n").filter(Boolean).length} 条详细日志。`);
           await refreshHubState(true);
         } catch (error) { toast(`RECALL 失败：${error?.message || error}`); }
@@ -7911,7 +8674,7 @@
               <b>当前读取状态</b>
               <div class="sync-source-tag"><span>来源：<b>${esc(lastSource)}</b></span><span class="sync-source-separator">•</span><span>全库 ${s.counts.memories} 条</span><span class="sync-source-separator">•</span><span>当前 TA ${mems.length} 条</span></div>
             </div>
-            <button class="sync-refresh-btn" id="syncLogRefresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 12a9 9 0 0 1-15.5 6.2"/><path d="M3 12A9 9 0 0 1 18.5 5.8"/><path d="M18 2v4h4"/><path d="M6 22v-4H2"/></svg><span>从 SullyOS 刷新</span></button>
+            <button class="sync-refresh-btn" id="syncLogRefresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 12a9 9 0 0 1-15.5 6.2"/><path d="M3 12A9 9 0 0 1 18.5 5.8"/><path d="M18 2v4h4"/><path d="M6 22v-4H2"/></svg><span>与 SullyOS 临时对比</span></button>
           </div>
           <div class="sync-status-grid">
             <div class="sync-mini-stat" style="--metric-color:#94a3b8"><div class="sync-metric-label"><i class="sync-metric-dot"></i><span>待同步</span></div><b style="color:#8c879a">${grouped[0][1].length}</b></div>
@@ -7932,7 +8695,7 @@
         } finally {
           if (document.body.contains(button)) {
             button.disabled = false;
-            button.querySelector("span").textContent = "从 SullyOS 刷新";
+            button.querySelector("span").textContent = "与 SullyOS 临时对比";
           }
         }
       };
@@ -9776,19 +10539,12 @@
       try {
         if (serverMode()) {
           const result = await api("/api/sully/fetch", { method:"POST", body: JSON.stringify({ ...settings, charId:selectedCharId }) });
-          data = normalizeImport(result.data);
-          activeChar = selectedCharId && data.characters.some(c => c.id === selectedCharId)
-            ? selectedCharId
-            : keepChar && data.characters.some(c => c.id === keepChar) ? keepChar : "";
-          activeRoom = keepRoom || "living_room";
-          rememberScope();
-          cacheHubDataLocally();
-          localStorage.setItem("memoryHub.lastSource", selectedCharId ? "SullyOS 单角色同步到 Hub 本地库" : "SullyOS 全量镜像同步到 Hub 本地库");
-          setView(stayView && activeChar ? stayView : "roles");
-          const scopeLabel = selectedCharId ? (data.characters.find(c => c.id === selectedCharId)?.name || selectedCharId) : "全部角色";
-          const removedCount = (result.deletedCharacterIds || []).length;
-          const removedText = removedCount ? `，已移除 ${removedCount} 个源端已删除角色` : "";
-          toast(`已同步 ${scopeLabel}${removedText}：Hub 当前共 ${data.memories.length} 条记忆。`);
+          const labels = { characters:"角色", memories:"记忆", coreMemories:"核心记忆", vectors:"向量", links:"关系", roomPlates:"门牌", impressions:"印象", eventBoxes:"事件盒", anticipations:"期盼", digestReports:"Digest" };
+          const domains = Object.keys(result.hubPreview || {});
+          $("infoTitle").textContent = selectedCharId ? "当前 TA · Hub / SullyOS 临时对比" : "Hub / SullyOS 临时对比";
+          $("infoBody").innerHTML = `<div class="safety ok"><b>不储存此次拉取</b>两侧数据只在本次请求内存中生成摘要与差异；关闭窗口后丢弃，不覆盖 Hub，也不生成第二份快照。</div><br><div class="memory-list">${domains.map(domain=>{const h=result.hubPreview[domain]||{};const s=result.sullyPreview?.[domain]||{};const d=result.differences?.[domain]||{};return `<div class="memory-item"><div class="memory-top"><b>${esc(labels[domain]||domain)}</b><span class="chip" style="color:${d.sameHash?"var(--green)":"var(--amber)"}">${d.sameHash?"一致":"有差异"}</span></div><div class="stat-grid"><div class="stat-box"><span>Hub 预览</span><b>${Number(h.count||0)}</b></div><div class="stat-box"><span>SullyOS 预览</span><b>${Number(s.count||0)}</b></div></div>${!d.sameHash?`<div class="card-meta"><span class="chip">仅 Hub ${(d.onlyInHub||[]).length}</span><span class="chip">仅 SullyOS ${(d.onlyInSully||[]).length}</span></div>`:""}</div>`}).join("")}</div>`;
+          openModal("infoModal");
+          toast("双向拉取对比已生成；没有保存 SullyOS 预览数据。");
           return;
         }
         const res = await fetch(url, { mode:"cors" });
@@ -9982,6 +10738,16 @@
       });
     });
     $("testConnections").onclick = testConnections;
+    $("previewSync").onclick = async () => {
+      settings = {
+        ...settings,
+        sullyUrl:$("sullyUrl").value.trim() || settingsDefault.sullyUrl,
+        exportPath:$("exportPath").value.trim() || settingsDefault.exportPath,
+        memoryHubToken:$("memoryHubToken").value.trim()
+      };
+      closeModal("settingsModal");
+      await fetchSully();
+    };
     $("modePill").onclick = () => { $("infoTitle").textContent = "安全说明"; $("infoBody").innerHTML = `<div class="card"><h3>当前能做</h3><p>读取或导入 SullyOS 记忆、选择 TA、查看房间、门牌、印象、feel、搜索、查向量、导出备份；需要时手动调用外部桥接能力。</p></div><div class="card"><h3>当前不会做</h3><p>不会写回 SullyOS，不会自动共享私密房间；外部推送必须手动点。</p></div>`; openModal("infoModal"); };
     document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => closeModal(b.dataset.close));
     document.querySelectorAll(".drawer-backdrop").forEach(backdrop => {
@@ -10033,6 +10799,7 @@
     $("settingsImportJson").onclick = () => $("jsonFile").click();
     $("resetHub").onclick = resetHubData;
     $("jsonFile").onchange = async e => { const file=e.target.files?.[0]; await importJsonFile(file); e.target.value=""; };
+    $("migrationFile").onchange = async e => { const file=e.target.files?.[0]; if (file) await previewMigrationFile(file); e.target.value=""; };
     $("refreshHub").onclick = () => refreshHubState(false);
     async function boot() {
       if (serverMode()) {

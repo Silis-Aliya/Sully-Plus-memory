@@ -15,7 +15,7 @@ https://memory.example.com  Memory Hub
 
 ## Required Runtime
 
-- Node.js 18+
+- Node.js 22.5+（Memory Hub 权威层使用内置 `node:sqlite`）
 - A reverse proxy such as Nginx or Caddy
 - A persistent data directory, for example `/var/lib/sully-memory-hub`
 
@@ -47,7 +47,7 @@ Use a long random token for `MEMORY_HUB_TOKEN`. The dashboard sends it as `X-Mem
 npm start
 ```
 
-Health check:
+Health check（角色、消息与运行域都从 `authority.sqlite` 恢复；无需 `hub-data.json`）：
 
 ```bash
 curl http://127.0.0.1:8787/api/health
@@ -189,3 +189,24 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now sully-memory-hub
 sudo systemctl status sully-memory-hub
 ```
+
+### Claude Code runner
+
+Do not enable the runner while `authorityMode` is still `shadow`. After V2
+promotion and parity verification, install Claude Code for the `sully` service
+user, verify that `claude` is on its PATH, then install the separate runner:
+
+```bash
+sudo cp deploy/sully-memory-hub-cc-runner.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sully-memory-hub-cc-runner
+sudo systemctl status sully-memory-hub-cc-runner
+```
+
+The runner does not schedule its own check-ins. It only claims Hub-created
+`brain.wake`, `autonomy.wake`, and `computer.task` wake rows. It resumes the
+per-character Claude `sessionId`, mounts the HTTP-only Memory Hub MCP server,
+and commits the final Claude result verbatim as an internal activity using a
+stable command ID. A user-visible message is created only when CC explicitly
+uses the Hub message tool; the runner never turns background prose into a chat
+bubble automatically.

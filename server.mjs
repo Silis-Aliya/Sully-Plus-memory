@@ -1,5 +1,6 @@
 ﻿import http from "node:http";
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -33,6 +34,24 @@ import {
   buildSullyImpressionRequest,
   normalizeUserImpression,
 } from "./sullyImpression.mjs";
+import {
+  CONTRACT_PACKAGE_VERSION,
+  PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  contractManifest,
+  schemas as contractSchemas,
+  validateContract,
+} from "./packages/hub-contract/index.mjs";
+import { AuthorityError, AuthorityStore, contentHash } from "./authorityStore.mjs";
+import { normalizeSullyChatTurnRequest, sullyCompatibilityDescriptor } from "./sullyCompatAdapter.mjs";
+import { buildContextParity } from "./contextParity.mjs";
+import { buildScheduleInjection, resolveScheduleSlots } from "./sullyScheduleInjection.mjs";
+import { RuntimeV2ReadRepository } from "./src/storage/runtimeV2ReadRepository.mjs";
+import { RuntimeReadModeController } from "./src/storage/runtimeReadModeController.mjs";
+import { RuntimeV2NativeCommandExecutor } from "./src/storage/runtimeV2NativeCommandExecutor.mjs";
+import { RuntimeV2PromotionManager } from "./src/storage/runtimeV2PromotionManager.mjs";
+import { deriveActivityStatePatch } from "./src/runtime/activityState.mjs";
+import { formatSullyVrCardMessage } from "./sullyVrContext.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -50,6 +69,20 @@ const DATA_DIR = process.env.MEMORY_HUB_DATA_DIR || path.join(__dirname, ".memor
 const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
 const DATA_FILE = path.join(DATA_DIR, "hub-data.json");
 const RUNTIME_FILE = path.join(DATA_DIR, "runtime.json");
+const AUTHORITY_DB_FILE = path.join(DATA_DIR, "authority.sqlite");
+const MESSAGE_TEXT_MAX_BYTES = Math.max(1024, Number(process.env.MEMORY_HUB_MESSAGE_TEXT_MAX_BYTES || 64 * 1024));
+const MESSAGE_INLINE_MEDIA_MAX_BYTES = Math.max(1024, Number(process.env.MEMORY_HUB_INLINE_MEDIA_MAX_BYTES || 1024 * 1024));
+const MESSAGE_JSON_MAX_BYTES = Math.max(MESSAGE_TEXT_MAX_BYTES, Number(process.env.MEMORY_HUB_MESSAGE_JSON_MAX_BYTES || 2 * 1024 * 1024));
+const STORAGE_QUOTA_BYTES = Math.max(100 * 1024 * 1024, Number(process.env.MEMORY_HUB_STORAGE_QUOTA_BYTES || 10 * 1024 * 1024 * 1024));
+const ACTION_RUNTIME_INTERVAL_MS = Math.max(1000, Number(process.env.MEMORY_HUB_ACTION_RUNTIME_INTERVAL_MS || 5000));
+const ACTION_RUNTIME_ENABLED = !["0", "false", "off"].includes(cleanEnv(process.env.MEMORY_HUB_ACTION_RUNTIME_ENABLED || "true").toLowerCase());
+const RUNTIME_READ_MODE = cleanEnv(process.env.MEMORY_HUB_RUNTIME_READ_MODE || "legacy").toLowerCase();
+const RUNTIME_PARITY_INTERVAL_MS = Math.max(60_000, Number(process.env.MEMORY_HUB_RUNTIME_PARITY_INTERVAL_MS || 15 * 60 * 1000));
+const RUNTIME_NATIVE_WRITES_ENABLED = ["1", "true", "on"].includes(cleanEnv(process.env.MEMORY_HUB_RUNTIME_NATIVE_WRITES_ENABLED || "false").toLowerCase());
+
+function cleanEnv(value) {
+  return value === undefined || value === null ? "" : String(value).trim();
+}
 
 async function loadDotEnv(file) {
   try {
@@ -173,6 +206,395 @@ const MIME = {
 
 await fs.mkdir(DATA_DIR, { recursive: true });
 let hubDataCache = null;
+let runtimeDataCache = null;
+const authorityStore = new AuthorityStore(AUTHORITY_DB_FILE);
+const runtimeV2Reader = new RuntimeV2ReadRepository(authorityStore.db);
+const runtimeReadMode = new RuntimeReadModeController({
+  mode: RUNTIME_READ_MODE,
+  databaseFile: AUTHORITY_DB_FILE,
+  intervalMs: RUNTIME_PARITY_INTERVAL_MS,
+  authorityMode: () => authorityStore.runtimeV2.authorityMode(),
+  authorityHealth: () => authorityStore.runtimeV2Health(),
+});
+runtimeReadMode.initialize();
+const runtimeNativeCommands = new RuntimeV2NativeCommandExecutor(authorityStore, { protocolVersion: PROTOCOL_VERSION });
+const runtimeV2Promotion = new RuntimeV2PromotionManager(authorityStore);
+const V2_RUNTIME_DOMAINS = ["memories", "vectors", "links", "eventBoxes", "roomPlates", "anticipations", "digestReports", "characterRuntime"];
+
+function useV2RuntimeReads() {
+  const authoritative = authorityStore.runtimeV2.authorityMode() === "v2";
+  if (!runtimeReadMode.usesV2Reads()) {
+    if (authoritative) throw new AuthorityError("V2_AUTHORITY_UNAVAILABLE", "V2 authority is active but unavailable; legacy fallback is blocked", 503, runtimeReadMode.publicStatus());
+    return false;
+  }
+  const health = authorityStore.runtimeV2Health();
+  if (health.ok) return true;
+  runtimeReadMode.degrade(`V2 shadow write health failed (${health.openFailures} open failures, ${health.failedDomains} failed domains)`);
+  if (authoritative) throw new AuthorityError("V2_AUTHORITY_UNAVAILABLE", "V2 authority health failed; legacy fallback is blocked", 503, { health, readMode: runtimeReadMode.publicStatus() });
+  return false;
+}
+const CHARACTER_DEFINITION_FIELDS = new Set([
+  "characterId", "name", "avatar", "description", "systemPrompt", "worldview",
+  "exampleDialogue", "writerPersona", "personalityStyle", "ruminationTendency", "timeZone",
+]);
+const CHARACTER_METADATA_FIELDS = new Set(["id", "version", "updatedAt", "deletedAt", "sourceAuthority", "_hash", "_fieldVersions"]);
+
+function splitCharacterProfile(character) {
+  const id = clean(character?.characterId || character?.id || "");
+  const definition = { characterId: id };
+  const runtime = { id };
+  for (const [key, value] of Object.entries(character || {})) {
+    if (CHARACTER_METADATA_FIELDS.has(key) || key === "mountedWorldbooks") continue;
+    if (CHARACTER_DEFINITION_FIELDS.has(key)) definition[key] = value;
+    else runtime[key] = value;
+  }
+  if (!definition.name) definition.name = id || "Unnamed Character";
+  return { id, definition, runtime, mountedWorldbooks: Array.isArray(character?.mountedWorldbooks) ? character.mountedWorldbooks : [] };
+}
+
+function persistCharacterDefinitions(characters, actorId = "unified-state") {
+  const runtimeById = {};
+  for (const character of characters || []) {
+    const split = splitCharacterProfile(character);
+    if (!split.id) continue;
+    authorityStore.putEntity("character", split.id, split.definition, { actorId, sourceAuthority: "hub" });
+    runtimeById[split.id] = split.runtime;
+    for (const mounted of split.mountedWorldbooks) {
+      const worldbookId = clean(mounted?.worldbookId || mounted?.id || "");
+      if (!worldbookId) continue;
+      if (!authorityStore.getEntity("worldbook", worldbookId)) {
+        authorityStore.putEntity("worldbook", worldbookId, { ...mounted, worldbookId }, { actorId, sourceAuthority: "hub" });
+      }
+      try { authorityStore.mountWorldbook(split.id, worldbookId, { actorId }); } catch {}
+    }
+  }
+  return runtimeById;
+}
+
+function canonicalizeHubState(data, actorId = "unified-state") {
+  const source = data && typeof data === "object" ? data : EMPTY_DATA;
+  const runtimeById = persistCharacterDefinitions(source.characters || [], actorId);
+  const state = { ...source, unifiedStateVersion: 1, characterRuntime: runtimeById };
+  delete state.characters;
+  return state;
+}
+
+function materializeHubState(state) {
+  const source = state && typeof state === "object" ? state : EMPTY_DATA;
+  const runtimeById = source.characterRuntime && typeof source.characterRuntime === "object" ? source.characterRuntime : {};
+  const worldbooks = new Map(authorityStore.listEntities("worldbook", { limit: 5000 }).map((record) => [record.entityId, record.data]));
+  const characters = authorityStore.listEntities("character", { limit: 5000 }).map((record) => {
+    const mountedWorldbooks = authorityStore.listMounts(record.entityId)
+      .map((mount) => worldbooks.get(mount.worldbookId))
+      .filter(Boolean);
+    return { id: record.entityId, ...record.data, ...(runtimeById[record.entityId] || {}), mountedWorldbooks };
+  });
+  const data = { ...source, characters };
+  delete data.characterRuntime;
+  return data;
+}
+
+function refreshHubDataCache() {
+  hubDataCache = materializeHubState(loadHubRuntimeDomains());
+  return hubDataCache;
+}
+
+function loadHubRuntimeDomains() {
+  const rows = authorityStore.listRuntimeDomains();
+  const legacy = Object.fromEntries(Object.entries(rows)
+    .filter(([key]) => key.startsWith("hub:"))
+    .map(([key, record]) => [key.slice(4), record.data]));
+  if (!useV2RuntimeReads()) return legacy;
+  for (const domain of V2_RUNTIME_DOMAINS) legacy[domain] = runtimeV2Reader.getDomain(domain);
+  return legacy;
+}
+
+function persistHubRuntimeDomains(canonical) {
+  const desired = new Set(Object.keys(canonical || {}).map((key) => `hub:${key}`));
+  const current = authorityStore.listRuntimeDomainKeys();
+  for (const [key, value] of Object.entries(canonical || {})) authorityStore.putRuntimeDomain(`hub:${key}`, value);
+  for (const key of current) if (key.startsWith("hub:") && !desired.has(key)) authorityStore.deleteRuntimeDomain(key);
+}
+
+function loadMessageRuntime() {
+  const meta = authorityStore.getRuntimeDomain("message:meta", EMPTY_RUNTIME)?.data || EMPTY_RUNTIME;
+  const messages = useV2RuntimeReads() ? runtimeV2Reader.listMessages() : authorityStore.listRuntimeMessages();
+  return { ...EMPTY_RUNTIME, ...meta, messages };
+}
+
+function persistMessageRuntime(runtime) {
+  const meta = { ...(runtime || EMPTY_RUNTIME) };
+  const messages = Array.isArray(meta.messages) ? meta.messages : [];
+  delete meta.messages;
+  authorityStore.replaceRuntimeMessages(messages);
+  authorityStore.putRuntimeDomain("message:meta", meta);
+}
+
+const RUNTIME_SURFACES = new Set(["chat", "activity", "world", "state", "memory", "schedule", "system"]);
+const RUNTIME_VISIBILITIES = new Set(["user", "internal"]);
+
+function normalizeRuntimeSurface(value, fallback = "") {
+  const normalized = clean(value).toLowerCase();
+  return RUNTIME_SURFACES.has(normalized) ? normalized : fallback;
+}
+
+function inferRuntimeMessageSurface(item = {}) {
+  const explicit = normalizeRuntimeSurface(item.surface || item.metadata?.surface || item.metadata?.runtimeSurface);
+  if (explicit) return explicit;
+  const hint = clean(item.type || item.metadata?.eventType || item.metadata?.kind || "").toLowerCase();
+  if (/(memory|legacy|impression|recall)/.test(hint)) return "memory";
+  if (/(world|scene|location|room)/.test(hint)) return "world";
+  if (/(schedule|reminder|task|job)/.test(hint)) return "schedule";
+  if (/(state|emotion|mood|buff|energy|relationship|anticipation)/.test(hint)) return "state";
+  if (/(activity|action|life[_-]?sim|diary)/.test(hint)) return "activity";
+  if (clean(item.role).toLowerCase() === "system") return "system";
+  return "chat";
+}
+
+function effectiveRuntimeMessageScope(item = {}) {
+  const type = clean(item.type || item.messageType || item.metadata?.eventType || item.metadata?.kind).toLowerCase();
+  const role = clean(item.role).toLowerCase();
+  const content = clean(item.content || item.text || item.body || "");
+  const metadata = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const explicitSurface = normalizeRuntimeSurface(item.surface || metadata.surface || metadata.runtimeSurface);
+  // SullyOS historically stored every rendered phone item in one chat array.
+  // These structural records are not dialogue even when legacy data says
+  // surface=chat. Keep the stored source untouched and derive the read surface.
+  if (type === "vr_card" || metadata.vrCard === true || /^「彼方\s*[·・]/.test(content)) {
+    return { surface: "activity", visibility: "internal", conversationId: null };
+  }
+  if (metadata.hidden === true || metadata.proactiveHint === true) {
+    return { surface: "system", visibility: "internal", conversationId: null };
+  }
+  // An explicitly assigned non-chat domain is authoritative. In particular,
+  // activity records may legitimately use role=system without becoming system
+  // control messages on read.
+  if (explicitSurface && explicitSurface !== "chat") {
+    return { surface: explicitSurface, visibility: normalizeRuntimeVisibility(item.visibility || metadata.visibility, explicitSurface), conversationId: null };
+  }
+  const chatSystemCard = ["score_card", "music_invite_result"].includes(type);
+  if (role === "system" && !chatSystemCard) {
+    return { surface: "system", visibility: "internal", conversationId: null };
+  }
+  const surface = inferRuntimeMessageSurface(item);
+  const visibility = normalizeRuntimeVisibility(item.visibility || metadata.visibility, surface);
+  const charId = clean(item.charId || item.characterId);
+  const conversationId = surface === "chat" ? clean(item.conversationId || metadata.conversationId || `direct:me:${charId}`) : null;
+  return { surface, visibility, conversationId };
+}
+
+function normalizeRuntimeVisibility(value, surface) {
+  const normalized = clean(value).toLowerCase();
+  if (RUNTIME_VISIBILITIES.has(normalized)) return normalized;
+  return surface === "chat" ? "user" : "internal";
+}
+
+function inferRuntimeOrigin(item = {}, role = "") {
+  const explicit = clean(item.origin || item.metadata?.origin).toLowerCase();
+  if (explicit) return explicit;
+  if (item.metadata?.proactive || item.metadata?.jobId) return "scheduler";
+  if (role === "assistant") return "character";
+  if (role === "user") return "user";
+  return "system";
+}
+
+function normalizeRuntimeMessageScope(item = {}, charId = "", role = "") {
+  const surface = inferRuntimeMessageSurface(item);
+  const visibility = normalizeRuntimeVisibility(item.visibility || item.metadata?.visibility, surface);
+  const conversationId = surface === "chat"
+    ? clean(item.conversationId || item.metadata?.conversationId || `direct:me:${charId}`)
+    : null;
+  return { surface, visibility, conversationId, origin: inferRuntimeOrigin(item, role) };
+}
+
+function isChatRuntimeMessage(item = {}, conversationId = "") {
+  const scope = effectiveRuntimeMessageScope(item);
+  if (scope.surface !== "chat" || scope.visibility !== "user") return false;
+  return !conversationId || scope.conversationId === conversationId;
+}
+
+function isVrCardRuntimeMessage(item = {}) {
+  const type = clean(item.type || item.messageType).toLowerCase();
+  const content = clean(item.content || item.text || item.body || "");
+  return type === "vr_card" || item.metadata?.vrCard === true || /^「彼方\s*[·・]/.test(content);
+}
+
+function inferEventSurface(type = "") {
+  const normalized = clean(type).toLowerCase();
+  if (normalized.startsWith("message.")) return "chat";
+  if (normalized.startsWith("memory.") || normalized.includes("recall") || normalized.includes("impression") || normalized.includes("legacy")) return "memory";
+  if (normalized.startsWith("world.") || normalized.startsWith("scene.") || normalized.includes("location")) return "world";
+  if (normalized.startsWith("schedule.") || normalized.startsWith("job.")) return "schedule";
+  if (normalized.startsWith("character.state") || normalized.includes("emotion") || normalized.includes("mood") || normalized.includes("buff")) return "state";
+  if (normalized.startsWith("character.activity") || normalized.startsWith("activity.")) return "activity";
+  return "system";
+}
+
+function decorateHubEvent(event = {}) {
+  const embeddedMessage = event.payload?.message;
+  const embeddedScope = embeddedMessage && typeof embeddedMessage === "object" ? effectiveRuntimeMessageScope(embeddedMessage) : null;
+  const surface = embeddedScope?.surface || normalizeRuntimeSurface(event.surface, inferEventSurface(event.type));
+  const visibility = embeddedScope?.visibility || normalizeRuntimeVisibility(event.visibility, surface === "chat" ? "chat" : surface);
+  return { ...event, surface, visibility };
+}
+
+function scheduleFeatureOn(character = {}) {
+  return character.scheduleFeatureEnabled === true
+    || (character.scheduleFeatureEnabled !== false && Boolean(character.scheduleStyle));
+}
+
+function resolveCharacterTimeZone(character = {}) {
+  return character.customTimezoneEnabled && clean(character.customTimezone)
+    ? clean(character.customTimezone)
+    : "";
+}
+
+function nowInCharacterTimeZone(character = {}, base = new Date()) {
+  const timeZone = resolveCharacterTimeZone(character);
+  if (!timeZone) return base;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }).formatToParts(base);
+    const map = {};
+    for (const part of parts) map[part.type] = part.value;
+    let hour = Number.parseInt(map.hour, 10);
+    if (hour === 24) hour = 0;
+    return new Date(
+      Number.parseInt(map.year, 10), Number.parseInt(map.month, 10) - 1, Number.parseInt(map.day, 10),
+      hour, Number.parseInt(map.minute, 10), Number.parseInt(map.second, 10),
+    );
+  } catch {
+    return base;
+  }
+}
+
+function localDateKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function runtimeCollectionValues(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [];
+  return Object.values(value).flatMap((item) => Array.isArray(item) ? item : [item]);
+}
+
+function resolveHubDailySchedule(data = {}, character = {}, baseNow = new Date()) {
+  if (!scheduleFeatureOn(character)) return null;
+  const wallNow = nowInCharacterTimeZone(character, baseNow);
+  const dateKey = localDateKey(wallNow);
+  const characterId = clean(character.id || character.characterId || "");
+  const schedules = runtimeCollectionValues(data.dailySchedules)
+    .filter((item) => item && clean(item.charId || item.characterId || "") === characterId && Array.isArray(item.slots));
+  return schedules.find((item) => clean(item.date || "") === dateKey || clean(item.id || "") === `${characterId}_${dateKey}`)
+    || schedules.find((item) => {
+      const generatedAt = Number(item.generatedAt);
+      return Number.isFinite(generatedAt) && localDateKey(nowInCharacterTimeZone(character, new Date(generatedAt))) === dateKey;
+    })
+    || null;
+}
+
+function runtimeActivityDetails(state = {}, character = {}) {
+  const activity = state.activity ?? character.activity;
+  const object = activity && typeof activity === "object" && !Array.isArray(activity) ? activity : {};
+  const name = typeof activity === "string"
+    ? clean(activity)
+    : clean(object.activity || object.name || object.label || object.title || object.type || "");
+  const rawLocation = state.location ?? object.location ?? character.location;
+  const location = typeof rawLocation === "string"
+    ? clean(rawLocation)
+    : clean(rawLocation?.name || rawLocation?.label || rawLocation?.sceneName || rawLocation?.sceneId || rawLocation?.location || "");
+  return {
+    name,
+    location,
+    innerThought: clean(state.innerState || state.evolvedNarrative || object.innerThought || ""),
+    startedAt: object.startedAt || state.activityStartedAt || null,
+  };
+}
+
+function buildHubScheduleRuntimeContext(data = {}, character = {}, snapshot = null, nowValue = Date.now()) {
+  const parsedNow = new Date(nowValue ?? Date.now());
+  const baseNow = Number.isNaN(parsedNow.getTime()) ? new Date() : parsedNow;
+  const wallNow = nowInCharacterTimeZone(character, baseNow);
+  const activity = runtimeActivityDetails(snapshot?.state || {}, character);
+  const scheduleEnabled = scheduleFeatureOn(character);
+  if (!scheduleEnabled && !activity.name) return { text: "", schedule: null, wallNow };
+  const storedSchedule = scheduleEnabled ? resolveHubDailySchedule(data, character, baseNow) : null;
+  let schedule = storedSchedule ? { ...storedSchedule, slots: storedSchedule.slots.map((slot) => ({ ...slot })) } : null;
+
+  if (activity.name) {
+    if (!schedule?.slots?.length) {
+      const startDate = activity.startedAt ? nowInCharacterTimeZone(character, new Date(activity.startedAt)) : wallNow;
+      const safeStart = Number.isNaN(startDate.getTime()) ? wallNow : startDate;
+      schedule = {
+        id: `${clean(character.id || character.characterId)}_${localDateKey(wallNow)}`,
+        charId: clean(character.id || character.characterId),
+        date: localDateKey(wallNow),
+        generatedAt: baseNow.getTime(),
+        slots: [{ startTime: `${String(safeStart.getHours()).padStart(2, "0")}:${String(safeStart.getMinutes()).padStart(2, "0")}`, activity: activity.name, ...(activity.location ? { location: activity.location } : {}), ...(activity.innerThought ? { innerThought: activity.innerThought } : {}) }],
+      };
+    } else {
+      const resolved = resolveScheduleSlots(schedule, wallNow);
+      const index = resolved.current ? schedule.slots.indexOf(resolved.current) : -1;
+      if (index >= 0) {
+        schedule.slots[index] = { ...schedule.slots[index], activity: activity.name, ...(activity.location ? { location: activity.location } : {}), ...(activity.innerThought ? { innerThought: activity.innerThought } : {}) };
+      } else {
+        schedule.slots.unshift({ startTime: `${String(wallNow.getHours()).padStart(2, "0")}:${String(wallNow.getMinutes()).padStart(2, "0")}`, activity: activity.name, ...(activity.location ? { location: activity.location } : {}), ...(activity.innerThought ? { innerThought: activity.innerThought } : {}) });
+      }
+    }
+  }
+
+  const evolvedNarrative = activity.innerThought || undefined;
+  return { text: schedule ? buildScheduleInjection(schedule, evolvedNarrative, wallNow) : "", schedule, wallNow };
+}
+
+const MIGRATION_RUNTIME_FALLBACKS = {
+  scheduled_message: "scheduledMessages",
+  daily_schedule: "dailySchedules",
+  world_episode: "worldEpisodes",
+  story_theater: "storyTheaters",
+  story_theater_preset: "storyTheaterPresets",
+  story_theater_mask: "storyTheaterMasks",
+  group: "groups",
+  character_group: "characterGroups",
+  topic_box: "topicBoxes",
+  digest_report: "digestReports",
+  memory_batch: "memoryBatches",
+  life_sim_state: "lifeSimState",
+  vr_music_room_state: "vrMusicRoom",
+  vr_guestbook_state: "vrGuestbook",
+  realtime_config: "realtimeConfig",
+};
+
+function promoteLegacyRuntimeIfNeeded() {
+  if (Object.keys(loadHubRuntimeDomains()).length) return false;
+  const hubDocument = authorityStore.getStateDocument("hub-runtime")?.data || EMPTY_DATA;
+  const materialized = Array.isArray(hubDocument?.characters) ? hubDocument : materializeHubState(hubDocument);
+  const runtimeDocument = authorityStore.getStateDocument("message-runtime")?.data || EMPTY_RUNTIME;
+  const archived = authorityStore.migrationObjectsByDomain();
+  const runtime = { ...EMPTY_RUNTIME, ...runtimeDocument };
+  if (!Array.isArray(runtime.messages) || runtime.messages.length === 0) runtime.messages = archived.message || [];
+  runtime.nextMessageSeq = runtime.messages.reduce((max, item) => Math.max(max, Number(item?.id || 0) + 1), Math.max(Number(runtime.nextMessageSeq || 1), runtime.messages.length + 1));
+  authorityStore.transaction(() => {
+    const canonical = canonicalizeHubState(materialized, "runtime-promotion");
+    for (const [domain, key] of Object.entries(MIGRATION_RUNTIME_FALLBACKS)) {
+      const items = archived[domain] || [];
+      if (!items.length) continue;
+      if (domain.endsWith("_state") || domain === "realtime_config") canonical[key] = items[0];
+      else if (!Array.isArray(canonical[key]) || canonical[key].length === 0) canonical[key] = items;
+    }
+    persistHubRuntimeDomains(canonical);
+    persistMessageRuntime(runtime);
+    authorityStore.finalizeRuntimePromotion({ actorId: "runtime-promotion" });
+  });
+  return true;
+}
+
+promoteLegacyRuntimeIfNeeded();
+hubDataCache = materializeHubState(loadHubRuntimeDomains());
+runtimeDataCache = loadMessageRuntime();
 
 function corsOrigin(req) {
   const origin = req.headers.origin || "";
@@ -196,7 +618,7 @@ function send(reqOrRes, resOrStatus, statusOrBody, bodyOrHeaders = {}, maybeHead
     "Content-Type": typeof body === "string" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8",
     ...(origin ? { "Access-Control-Allow-Origin": origin } : {}),
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Memory-Hub-Token, X-Sully-Bridge-Key",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     ...headers,
   });
   res.end(payload);
@@ -216,6 +638,9 @@ function authorized(req) {
 
 async function readJsonFile(file, fallback, options = {}) {
   if (file === DATA_FILE && hubDataCache) return hubDataCache;
+  if (file === RUNTIME_FILE && runtimeDataCache) return runtimeDataCache;
+  if (file === DATA_FILE) return refreshHubDataCache();
+  if (file === RUNTIME_FILE) return (runtimeDataCache = loadMessageRuntime());
   try {
     const parsed = JSON.parse(await fs.readFile(file, "utf8"));
     if (file === DATA_FILE) hubDataCache = parsed;
@@ -235,6 +660,16 @@ async function readJsonFile(file, fallback, options = {}) {
 }
 
 async function writeJsonFile(file, data) {
+  if (file === DATA_FILE || file === RUNTIME_FILE) {
+    JSON.parse(JSON.stringify(data));
+    authorityStore.transaction(() => {
+      if (file === DATA_FILE) persistHubRuntimeDomains(canonicalizeHubState(data, "memory-hub-runtime"));
+      else persistMessageRuntime(data);
+    });
+    if (file === DATA_FILE) hubDataCache = materializeHubState(loadHubRuntimeDomains());
+    if (file === RUNTIME_FILE) runtimeDataCache = loadMessageRuntime();
+    return;
+  }
   await fs.mkdir(path.dirname(file), { recursive: true });
   const payload = JSON.stringify(data);
   JSON.parse(payload);
@@ -1550,16 +1985,21 @@ function normalizeRuntimeState(raw = {}) {
   const messages = Array.isArray(state.messages)
     ? state.messages
       .filter((item) => item && Number.isFinite(Number(item.id)) && clean(item.charId))
-      .map((item) => ({
-        ...item,
-        id: Number(item.id),
-        charId: clean(item.charId),
-        sourceId: clean(item.sourceId || ""),
-        role: clean(item.role || "user").toLowerCase(),
-        content: clean(item.content || item.text || item.body || ""),
-        timestamp: Number(item.timestamp || item.createdAt || Date.now()),
-        metadata: item.metadata && typeof item.metadata === "object" ? item.metadata : {},
-      }))
+      .map((item) => {
+        const charId = clean(item.charId);
+        const role = clean(item.role || "user").toLowerCase();
+        return {
+          ...item,
+          id: Number(item.id),
+          charId,
+          sourceId: clean(item.sourceId || ""),
+          role,
+          content: clean(item.content || item.text || item.body || ""),
+          timestamp: Number(item.timestamp || item.createdAt || Date.now()),
+          metadata: item.metadata && typeof item.metadata === "object" ? item.metadata : {},
+          ...normalizeRuntimeMessageScope(item, charId, role),
+        };
+      })
     : [];
   const maxId = messages.reduce((max, item) => Math.max(max, item.id), 0);
   return {
@@ -1577,6 +2017,54 @@ function runtimeMessageKey(charId, sourceId) {
   return sourceId ? `${charId}:${sourceId}` : "";
 }
 
+function inlineMediaBytes(value) {
+  if (typeof value === "string") {
+    const match = value.match(/^data:(image|audio|video)\/[^;,]+(?:;[^,]*)?;base64,([A-Za-z0-9+/=\s]+)$/i);
+    if (!match) return 0;
+    const payload = match[2].replace(/\s/g, "");
+    const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+    return Math.max(0, Math.floor(payload.length * 3 / 4) - padding);
+  }
+  if (Array.isArray(value)) return value.reduce((sum, item) => sum + inlineMediaBytes(item), 0);
+  if (value && typeof value === "object") return Object.values(value).reduce((sum, item) => sum + inlineMediaBytes(item), 0);
+  return 0;
+}
+
+function validateRuntimeMessageSize(message) {
+  const content = clean(message?.content || message?.text || message?.body || "");
+  const contentIsMedia = /^data:(image|audio|video)\//i.test(content);
+  const textBytes = contentIsMedia ? 0 : Buffer.byteLength(content, "utf8");
+  const mediaBytes = inlineMediaBytes(message);
+  const jsonBytes = Buffer.byteLength(JSON.stringify(message || {}), "utf8");
+  if (textBytes > MESSAGE_TEXT_MAX_BYTES) throw new AuthorityError("MESSAGE_TOO_LARGE", `Message text exceeds ${MESSAGE_TEXT_MAX_BYTES} bytes`, 413, { textBytes, limit: MESSAGE_TEXT_MAX_BYTES });
+  if (mediaBytes > MESSAGE_INLINE_MEDIA_MAX_BYTES) throw new AuthorityError("INLINE_MEDIA_TOO_LARGE", `Inline media exceeds ${MESSAGE_INLINE_MEDIA_MAX_BYTES} bytes`, 413, { mediaBytes, limit: MESSAGE_INLINE_MEDIA_MAX_BYTES });
+  if (jsonBytes > MESSAGE_JSON_MAX_BYTES) throw new AuthorityError("MESSAGE_TOO_LARGE", `Message object exceeds ${MESSAGE_JSON_MAX_BYTES} bytes`, 413, { jsonBytes, limit: MESSAGE_JSON_MAX_BYTES });
+  return { textBytes, mediaBytes, jsonBytes };
+}
+
+function runtimeMessageStorageMetrics(messages = [], databaseBytes = 0) {
+  const totals = { count: messages.length, textBytes: 0, inlineMediaBytes: 0, jsonBytes: 0, inlineMediaMessages: 0, oversizedLegacyMessages: 0 };
+  for (const message of messages) {
+    const content = clean(message?.content || message?.text || message?.body || "");
+    const mediaBytes = inlineMediaBytes(message);
+    const jsonBytes = Buffer.byteLength(JSON.stringify(message || {}), "utf8");
+    totals.textBytes += /^data:(image|audio|video)\//i.test(content) ? 0 : Buffer.byteLength(content, "utf8");
+    totals.inlineMediaBytes += mediaBytes;
+    totals.jsonBytes += jsonBytes;
+    if (mediaBytes > 0) totals.inlineMediaMessages += 1;
+    if (jsonBytes > MESSAGE_JSON_MAX_BYTES || mediaBytes > MESSAGE_INLINE_MEDIA_MAX_BYTES) totals.oversizedLegacyMessages += 1;
+  }
+  const ratio = STORAGE_QUOTA_BYTES ? databaseBytes / STORAGE_QUOTA_BYTES : 0;
+  return {
+    ...totals,
+    databaseBytes,
+    quotaBytes: STORAGE_QUOTA_BYTES,
+    quotaRatio: Number(ratio.toFixed(6)),
+    level: ratio >= 0.85 ? "critical" : ratio >= 0.7 ? "warning" : "ok",
+    limits: { messageTextBytes: MESSAGE_TEXT_MAX_BYTES, inlineMediaBytes: MESSAGE_INLINE_MEDIA_MAX_BYTES, messageJsonBytes: MESSAGE_JSON_MAX_BYTES },
+  };
+}
+
 function appendRuntimeMessages(runtime, charId, incoming = []) {
   const list = Array.isArray(incoming) ? incoming : [incoming];
   const existingBySource = new Map(
@@ -1588,6 +2076,7 @@ function appendRuntimeMessages(runtime, charId, incoming = []) {
   const updated = [];
   for (const source of list) {
     if (!source || typeof source !== "object") continue;
+    validateRuntimeMessageSize(source);
     const targetCharId = clean(source.charId || source.characterId || charId);
     if (!targetCharId) continue;
     const sourceId = clean(source.sourceId ?? source.messageId ?? source.id ?? "");
@@ -1600,6 +2089,7 @@ function appendRuntimeMessages(runtime, charId, incoming = []) {
       content: clean(source.content || source.text || source.body || ""),
       timestamp: Number(source.timestamp || source.createdAt || source.time || Date.now()),
       metadata: source.metadata && typeof source.metadata === "object" ? source.metadata : {},
+      ...normalizeRuntimeMessageScope(source, targetCharId, role === "assistant" || role === "system" ? role : "user"),
     };
     const sourceKey = runtimeMessageKey(targetCharId, sourceId);
     const existingIndex = sourceKey ? existingBySource.get(sourceKey) : undefined;
@@ -1618,7 +2108,74 @@ function appendRuntimeMessages(runtime, charId, incoming = []) {
   return { appended, updated };
 }
 
+function persistActivityStateFromMessages(data, runtime, charId, messages = []) {
+  const activityMessages = messages
+    .filter((item) => effectiveRuntimeMessageScope(item).surface === "activity")
+    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+  if (!activityMessages.length) return { changed: false, snapshot: authorityStore.getSnapshot(charId), patch: null, inputCount: messages.length, activityCount: 0 };
+
+  const current = authorityStore.getSnapshot(charId);
+  const character = current?.character
+    || authorityStore.getEntity("character", charId)?.data
+    || (data.characters || []).find((item) => clean(item.id || item.characterId) === charId)
+    || null;
+  const user = current?.user || authorityStore.getEntity("userProfile", "me")?.data || character?.userProfile || null;
+  let patch = {};
+  for (const message of activityMessages) patch = mergeRuntimePatch(patch, deriveActivityStatePatch(message));
+  const nextState = mergeRuntimePatch(current?.state || data.characterRuntime?.[charId] || {}, patch);
+  if (JSON.stringify(nextState) === JSON.stringify(current?.state || {})) return { changed: false, snapshot: current, patch, inputCount: messages.length, activityCount: activityMessages.length };
+
+  const snapshot = authorityStore.transaction(() => {
+    const stateEvent = authorityStore.appendEvent({
+      type: "character.state.updated",
+      characterId: charId,
+      occurredAt: new Date().toISOString(),
+      protocolVersion: PROTOCOL_VERSION,
+      payload: {
+        source: "runtime.activity.ingest",
+        activityMessageIds: activityMessages.map((item) => item.sourceId || item.id),
+        patch,
+      },
+    });
+    return authorityStore.putSnapshot(charId, {
+      lastEventId: stateEvent.eventId,
+      protocolVersion: PROTOCOL_VERSION,
+      character,
+      user,
+      world: current?.world || null,
+      state: nextState,
+      recentMessages: runtime.messages.filter((item) => item.charId === charId && isChatRuntimeMessage(item)).slice(-100),
+    }, { expectedVersion: current?.snapshotVersion || 0 });
+  });
+  return { changed: true, snapshot, patch, inputCount: messages.length, activityCount: activityMessages.length };
+}
+
+async function backfillLatestActivityStates() {
+  const [data, runtime] = await Promise.all([
+    readJsonFile(DATA_FILE, EMPTY_DATA),
+    readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME),
+  ]);
+  const normalizedRuntime = normalizeRuntimeState(runtime);
+  const latestByCharacter = new Map();
+  for (const message of normalizedRuntime.messages) {
+    if (effectiveRuntimeMessageScope(message).surface !== "activity") continue;
+    const charId = clean(message.charId || message.characterId);
+    if (!charId) continue;
+    const current = latestByCharacter.get(charId);
+    const currentTime = Number(current?.timestamp || current?.createdAt || 0);
+    const messageTime = Number(message.timestamp || message.createdAt || 0);
+    if (!current || messageTime > currentTime || (messageTime === currentTime && Number(message.id || 0) > Number(current.id || 0))) latestByCharacter.set(charId, message);
+  }
+  let changed = 0;
+  for (const [charId, message] of latestByCharacter) {
+    const result = persistActivityStateFromMessages(data, normalizedRuntime, charId, [message]);
+    if (result.changed) changed += 1;
+  }
+  return { characters: latestByCharacter.size, changed };
+}
+
 function isRuntimeSemanticMessage(item = {}) {
+  if (!isChatRuntimeMessage(item)) return false;
   if (item.metadata?.hidden || item.metadata?.noMemory) return false;
   const content = clean(item.content || "");
   if (!content) return false;
@@ -3456,11 +4013,11 @@ function hubRoomLabel(roomKey, userName = "用户") {
 
 function hubRoomDescription(roomKey) {
   return {
-    living_room: "最近的日常互动",
+    living_room: "日常闲聊、近期互动",
     bedroom: "亲密情感、深层羁绊",
-    study: "知识、计划、任务",
-    user_room: "关于用户的长期信息",
-    self_room: "自我认知、人设稳定点",
+    study: "工作学习、技能成长",
+    user_room: "用户个人信息、习惯",
+    self_room: "角色自我认同、演变",
     attic: "未消化的困惑、潜意识",
     windowsill: "期盼、目标、憧憬",
   }[roomKey] || "";
@@ -3589,8 +4146,8 @@ function buildEventBoxRecallItem(hubData, box, score, now, options = {}) {
   };
 }
 
-function expandAndFormatHubRecall(scored = [], hubData, { charId = "", userName = "用户", maxOutputItems = 15, query = "", eventBoxMode = "compat", eventBoxLiveLimit = 5 } = {}) {
-  const now = Date.now();
+function expandAndFormatHubRecall(scored = [], hubData, { charId = "", userName = "用户", maxOutputItems = 15, query = "", eventBoxMode = "compat", eventBoxLiveLimit = 5, now = Date.now() } = {}) {
+  now = Number.isFinite(Number(now)) ? Number(now) : Date.now();
   const allCharNodes = (hubData.memories || []).filter((item) => !charId || item.charId === charId);
   const pinnedNodes = allCharNodes.filter((item) => item.pinnedUntil && item.pinnedUntil > now && !item.archived);
   const pinnedIds = new Set(pinnedNodes.map((item) => item.id));
@@ -3684,7 +4241,9 @@ function formatRoomPlatesContext(roomPlates = [], userName = "用户") {
     const suffix = roomKey === "bedroom" ? "（没有名字，也不需要名字——只有质地）" : "";
     sections.push(`**${titles[roomKey]}**${suffix}\n${entries.map((entry) => `- ${clean(entry.text || entry.content)}`).join("\n")}`);
   }
-  return sections.length ? `### 房间门牌 (Room Plates)\n${sections.join("\n\n")}` : "";
+  return sections.length
+    ? `### 底色认知 (Resident Knowledge)\n以下是你早已知道的背景。它们是你认知的底色，不是话题——不要主动提起，也不要逐条复述，只在相关时让它们自然影响你的反应、措辞与温度。\n\n${sections.join("\n\n")}\n`
+    : "";
 }
 
 async function reindexHubVectors(settings, hubData, options = {}) {
@@ -3716,6 +4275,7 @@ async function recallHubData(settings, hubData, body = {}) {
   const memories = (hubData.memories || []).filter((item) => (
     (!charId || item.charId === charId)
     && (!roomFilter || item.room === roomFilter)
+    && !item.archived
   ));
   const vectors = (hubData.vectors || []).filter((item) => !charId || item.charId === charId);
   const vectorByMemory = new Map(vectors.map((item) => [vectorKey(item), item]).filter(([key]) => key));
@@ -3738,7 +4298,7 @@ async function recallHubData(settings, hubData, body = {}) {
     const textScore = keywordScore(query, memory);
     const importanceBoost = (Number(memory.importance) || 0) / 100;
     return { ...memory, recallScore: vectorScore ? vectorScore + textScore * 0.01 + importanceBoost : textScore + importanceBoost };
-  }).filter((memory) => memory.recallScore > 0).sort((a, b) => b.recallScore - a.recallScore).slice(0, candidateLimit);
+  }).filter((memory) => memory.recallScore > 0 && (queryVector || keywordScore(query, memory) > 0)).sort((a, b) => b.recallScore - a.recallScore).slice(0, candidateLimit);
   let scored = scoredPool.slice(0, limit);
   const rerankConfig = resolveRerankConfig(settings, hubData, body.rerank || {});
   const rerankMeta = {
@@ -3786,7 +4346,14 @@ async function recallHubData(settings, hubData, body = {}) {
     query,
     eventBoxMode,
     eventBoxLiveLimit,
+    now: body.now,
   });
+  const recallState = authorityStore.recordRecallState(
+    scored.map((memory) => memory.id),
+    charId,
+    body.now ?? Date.now(),
+    { persist: body.persistState === true },
+  );
   const userName = clean(body.userName || "用户");
   const scopedRoomPlates = (hubData.roomPlates || []).filter((item) => !charId || item.charId === charId);
   const roomPlatesContext = formatRoomPlatesContext(scopedRoomPlates, userName);
@@ -3835,6 +4402,8 @@ async function recallHubData(settings, hubData, body = {}) {
     formatterStats: formatted.stats,
     trace,
     rerank: rerankMeta,
+    stateChanges: recallState.changes,
+    statePersisted: recallState.persisted,
     plates: pickRelated(roomPlateRecallEntries(hubData.roomPlates)),
     impressions: pickRelated(hubData.impressions),
     feels: pickRelated(hubData.feels),
@@ -4149,6 +4718,272 @@ async function syncToOmbre(settings, hubData, options = {}) {
   };
 }
 
+function normalizeHubCommand(input = {}, defaults = {}) {
+  const commandId = clean(input.commandId || defaults.commandId || randomUUID());
+  const existingIssuedAt = input.issuedAt === undefined && commandId
+    ? authorityStore.getCommand(commandId)?.issuedAt
+    : null;
+  return {
+    commandId,
+    type: clean(input.type || defaults.type || "command.submit"),
+    actorId: clean(input.actorId || defaults.actorId || "sullyos-client"),
+    characterId: input.characterId === null ? null : clean(input.characterId || defaults.characterId || "") || null,
+    worldId: input.worldId === null ? null : clean(input.worldId || defaults.worldId || "") || null,
+    ...(input.expectedVersion === undefined ? {} : { expectedVersion: Number(input.expectedVersion) }),
+    issuedAt: input.issuedAt || defaults.issuedAt || existingIssuedAt || new Date().toISOString(),
+    protocolVersion: clean(input.protocolVersion || defaults.protocolVersion || PROTOCOL_VERSION),
+    ...(input.client === undefined ? {} : { client: input.client }),
+    payload: input.payload && typeof input.payload === "object" && !Array.isArray(input.payload) ? input.payload : (defaults.payload || {}),
+    ...(Array.isArray(input.unset) ? { unset: input.unset } : {}),
+  };
+}
+
+function requireValidContract(name, value) {
+  const result = validateContract(name, value);
+  if (!result.ok) throw new AuthorityError("VALIDATION_FAILED", `${name} contract validation failed`, 400, { errors: result.errors });
+}
+
+function resolveChatTurnConfig(body = {}, data = {}, settings = {}) {
+  const requested = body.apiConfig || body.modelConfig || {};
+  const stored = data.modelConfig?.chat || data.modelConfig?.main || data.chatModelConfig || data.modelConfig?.lightLLM || {};
+  return normalizeApiConfig(requested, {
+    baseUrl: stored.baseUrl || settings.chatBaseUrl || "",
+    apiKey: stored.apiKey || settings.chatApiKey || "",
+    model: stored.model || settings.chatModel || "",
+  });
+}
+
+async function requestAssembledContext(characterId, body = {}) {
+  const localHost = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
+  const response = await fetchWithTimeout(`http://${localHost}:${PORT}/api/v1/context/assemble`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(HUB_TOKEN ? { "X-Memory-Hub-Token": HUB_TOKEN } : {}) },
+    body: JSON.stringify({ characterId, userId: body.userId, conversationId: body.conversationId, historyLimit: body.historyLimit, recallLimit: body.recallLimit, candidateLimit: body.candidateLimit, eventBoxMode: body.eventBoxMode, eventBoxLiveLimit: body.eventBoxLiveLimit, now: body.now }),
+  }, 120000);
+  const result = await readApiResponse(response);
+  if (!response.ok) throw new AuthorityError(result.code || "CONTEXT_ASSEMBLY_FAILED", result.error || "Context assembly failed", response.status, result.details);
+  return result;
+}
+
+function mergeRuntimePatch(current, patch) {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) return current;
+  const next = { ...(current || {}) };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    if (value === null) delete next[key];
+    else if (value && typeof value === "object" && !Array.isArray(value) && next[key] && typeof next[key] === "object" && !Array.isArray(next[key])) next[key] = mergeRuntimePatch(next[key], value);
+    else next[key] = value;
+  }
+  return next;
+}
+
+async function ensureCharacterSnapshot(characterId) {
+  const existing = authorityStore.getSnapshot(characterId);
+  if (existing) return existing;
+  const data = await readJsonFile(DATA_FILE, EMPTY_DATA);
+  const runtime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
+  const character = authorityStore.getEntity("character", characterId)?.data || (data.characters || []).find((item) => clean(item.id || item.characterId) === characterId);
+  if (!character) throw new AuthorityError("NOT_FOUND", `character ${characterId} was not found`, 404);
+  const user = authorityStore.getEntity("userProfile", "me")?.data || character.userProfile || null;
+  return authorityStore.transaction(() => {
+    const event = authorityStore.appendEvent({ type: "character.snapshot.initialized", characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { source: "action-runtime" } });
+    return authorityStore.putSnapshot(characterId, { lastEventId: event.eventId, protocolVersion: PROTOCOL_VERSION, character, user, world: null, state: data.characterRuntime?.[characterId] || {}, recentMessages: runtime.messages.filter((item) => item.charId === characterId && isChatRuntimeMessage(item)).slice(-100) });
+  });
+}
+
+async function buildCcContextPackage(characterId, { wakeRun = null, leaseToken = "", reason = "manual", recallLimit = 5, forceStable = false, sessionId = null } = {}) {
+  const data = await readJsonFile(DATA_FILE, EMPTY_DATA);
+  const character = (data.characters || []).find((item) => clean(item.id || item.characterId) === characterId);
+  if (!character) throw new AuthorityError("NOT_FOUND", `character ${characterId} was not found`, 404);
+  const session = authorityStore.runtimeV2.getCcSession(characterId) || authorityStore.runtimeV2.putCcSession(characterId, { sessionId, status: "idle" });
+  const userProfile = authorityStore.getEntity("userProfile", "me")?.data || character.userProfile || { name: "用户" };
+  const roomPlatesContext = formatRoomPlatesContext((data.roomPlates || []).filter((item) => clean(item.charId || item.characterId) === characterId), clean(userProfile.name || "用户"));
+  const snapshot = await ensureCharacterSnapshot(characterId);
+  const contextCharacter = { ...character, vrState: { ...(character.vrState || {}), ...(snapshot.state?.vrState || {}) } };
+  const scheduleRuntime = buildHubScheduleRuntimeContext(data, contextCharacter, snapshot, Date.now());
+  const stable = buildContextParity({ character: contextCharacter, userProfile, messages: [], memoryPalaceContext: "", roomPlatesContext, runtimeStateContext: scheduleRuntime.text, now: Date.now(), modelConfig: data.modelConfig || {} });
+  const stableContextHash = contentHash(stable.stableSystemPrompt), stableChanged = stableContextHash !== session.stableContextHash;
+  const stableContextVersion = stableChanged ? session.stableContextVersion + 1 : session.stableContextVersion;
+  const messages = runtimeV2Reader.listMessages({ charId: characterId, afterSourceSequence: session.lastSeenMessageSeq, limit: 500 });
+  const toMessageSeq = messages.reduce((max, item) => Math.max(max, Number(item.id || 0)), session.lastSeenMessageSeq);
+  const events = authorityStore.listEvents({ after: session.lastSeenEventId, limit: 500, characterId });
+  const wakeJob = wakeRun?.jobId ? authorityStore.getScheduledJob(wakeRun.jobId) : null;
+  const deliveryTargets = Array.isArray(wakeJob?.payload?.deliveryTargets)
+    ? [...new Set(wakeJob.payload.deliveryTargets.map((value) => clean(value)).filter(Boolean))]
+    : [];
+  const query = clean([reason, ...messages.slice(-8).map((item) => item.content)].join("\n"));
+  let recall = { items: [], memoryPalaceContext: "" };
+  if (character.memoryPalaceEnabled && query) {
+    const settings = { ...DEFAULT_SETTINGS, ...(await readJsonFile(SETTINGS_FILE, DEFAULT_SETTINGS)) };
+    recall = await recallHubData(settings, data, { charId: characterId, userName: clean(userProfile.name || "用户"), query, limit: Math.max(1, Math.min(5, Number(recallLimit) || 5)), candidateLimit: 30, persistState: true });
+  }
+  const context = {
+    characterId,
+    sessionId: sessionId || session.sessionId,
+    wakeRunId: wakeRun?.wakeRunId || null,
+    wakeReason: reason,
+    wake: wakeRun ? { jobId: wakeRun.jobId || null, jobType: wakeJob?.jobType || null, deliveryTargets } : null,
+    deliveryTargets,
+    stableContextVersion,
+    stableContextHash,
+    stableContext: forceStable || stableChanged || !session.lastWakeAt ? stable.stableSystemPrompt : null,
+    delta: { fromMessageSeq: session.lastSeenMessageSeq, toMessageSeq, messages, fromEventId: session.lastSeenEventId, toEventId: events.at(-1)?.eventId || session.lastSeenEventId, events },
+    recall: { items: (recall.items || []).slice(0, 5), memoryPalaceContext: recall.memoryPalaceContext || "" },
+    runtimeState: authorityStore.runtimeV2.getCharacterState(characterId)?.state || snapshot.state || {},
+    unfinishedTasks: authorityStore.listScheduledJobs({ characterId, limit: 100 }).filter((job) => ["pending", "retry", "running"].includes(job.status)),
+    generatedAt: new Date().toISOString(),
+  };
+  if (wakeRun) {
+    authorityStore.transaction(() => {
+      authorityStore.runtimeV2.attachCcWakeContext(wakeRun.wakeRunId, leaseToken, context, { fromMessageSeq: session.lastSeenMessageSeq, toMessageSeq, fromEventId: session.lastSeenEventId, toEventId: context.delta.toEventId, sessionId: context.sessionId });
+      authorityStore.runtimeV2.putCcSession(characterId, { sessionId: context.sessionId, stableContextVersion, stableContextHash, lastWakeAt: new Date().toISOString(), status: "running" });
+    });
+  }
+  return context;
+}
+
+function characterUnavailableUntil(snapshot, now = Date.now()) {
+  const state = snapshot?.state || {};
+  const candidates = [state.busyUntil, state.nextAvailableAt, state.activity?.busyUntil, state.schedule?.busyUntil]
+    .map((value) => Date.parse(value || ""))
+    .filter((value) => Number.isFinite(value) && value > now);
+  if (candidates.length) return new Date(Math.min(...candidates)).toISOString();
+  if (state.available === false || state.status === "busy") return new Date(now + 5 * 60 * 1000).toISOString();
+  return null;
+}
+
+async function executeScheduledJob(job) {
+  const snapshot = await ensureCharacterSnapshot(job.characterId);
+  const unavailableUntil = characterUnavailableUntil(snapshot);
+  if (unavailableUntil) {
+    const deferred = authorityStore.transaction(() => {
+      const result = authorityStore.deferScheduledJob(job.jobId, unavailableUntil, "character-busy");
+      authorityStore.appendEvent({ commandId: job.commandId, type: "schedule.deferred", characterId: job.characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { jobId: job.jobId, dueAt: unavailableUntil, reason: "character-busy" } });
+      return result;
+    });
+    return { status: "deferred", job: deferred };
+  }
+
+  if (["brain.wake", "autonomy.wake", "computer.task"].includes(job.jobType)) {
+    if (authorityStore.runtimeV2.authorityMode() !== "v2") {
+      const dueAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      const deferred = authorityStore.transaction(() => authorityStore.deferScheduledJob(job.jobId, dueAt, "v2-authority-required"));
+      return { status: "deferred", reason: "v2-authority-required", job: deferred };
+    }
+    return authorityStore.transaction(() => {
+      const session = authorityStore.runtimeV2.getCcSession(job.characterId) || authorityStore.runtimeV2.putCcSession(job.characterId, { status: "idle" });
+      const created = authorityStore.runtimeV2.createCcWakeRun({ characterId: job.characterId, jobId: job.jobId, sessionId: session.sessionId, wakeReason: clean(job.payload?.reason || job.jobType) });
+      const triggered = authorityStore.appendEvent({ commandId: job.commandId, type: "schedule.triggered", characterId: job.characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { jobId: job.jobId, jobType: job.jobType } });
+      const event = authorityStore.appendEvent({ commandId: job.commandId, type: "brain.wake.requested", characterId: job.characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { wakeRunId: created.wakeRun.wakeRunId, jobId: job.jobId, jobType: job.jobType, reason: created.wakeRun.wakeReason, triggeredEventId: triggered.eventId } });
+      const targets = Array.isArray(job.payload?.deliveryTargets) && job.payload.deliveryTargets.length ? job.payload.deliveryTargets : [`cc:${job.characterId}`];
+      const deliveries = authorityStore.enqueueOutboxForEvent(event.eventId, targets).map((item) => item.deliveryId);
+      const completed = authorityStore.completeScheduledJob(job.jobId);
+      if (created.created) authorityStore.runtimeV2.bumpNativeMutationSequence();
+      return { status: "wake-queued", job: completed, wakeRun: created.wakeRun, triggeredEventId: triggered.eventId, eventId: event.eventId, deliveries };
+    });
+  }
+
+  const payload = job.payload || {};
+  const statePatch = payload.statePatch || (job.jobType === "state.patch" ? payload.patch || {} : {});
+  const messageSpec = payload.message || (job.jobType === "message.notify" ? { content: payload.content, role: payload.role } : null);
+  const nativeAuthority = authorityStore.runtimeV2.authorityMode() === "v2";
+  let recentMessages = (snapshot.recentMessages || []).filter((item) => isChatRuntimeMessage(item));
+  let message = null;
+  let nativeMessageSpec = null;
+  if (clean(messageSpec?.content || "")) {
+    if (nativeAuthority) {
+      nativeMessageSpec = {
+        messageId: clean(messageSpec.messageId || messageSpec.sourceId) || `${job.jobId}:message`,
+        sourceMessageId: clean(messageSpec.sourceId) || `${job.jobId}:message`,
+        characterId: job.characterId,
+        role: clean(messageSpec.role || "assistant"),
+        messageType: clean(messageSpec.type || "text"),
+        content: clean(messageSpec.content),
+        surface: clean(messageSpec.surface || "chat"),
+        visibility: clean(messageSpec.visibility || "user"),
+        origin: "scheduler",
+        occurredAt: new Date(messageSpec.timestamp || job.dueAt).toISOString(),
+        metadata: { ...(messageSpec.metadata || {}), jobId: job.jobId, authority: "memory-hub", proactive: true },
+      };
+    } else {
+      const runtime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
+      const appended = appendRuntimeMessages(runtime, job.characterId, [{
+        sourceId: clean(messageSpec.sourceId || "") || `${job.jobId}:message`,
+        role: clean(messageSpec.role || "assistant"),
+        type: clean(messageSpec.type || "text"),
+        content: clean(messageSpec.content),
+        timestamp: Number(messageSpec.timestamp || Date.now()),
+        metadata: { ...(messageSpec.metadata || {}), jobId: job.jobId, authority: "memory-hub", proactive: true },
+      }]);
+      await writeJsonFile(RUNTIME_FILE, runtime);
+      message = appended.appended[0] || appended.updated[0] || null;
+      recentMessages = runtime.messages.filter((item) => item.charId === job.characterId && isChatRuntimeMessage(item)).slice(-100);
+    }
+  }
+
+  const result = authorityStore.transaction(() => {
+    const triggered = authorityStore.appendEvent({ commandId: job.commandId, type: "schedule.triggered", characterId: job.characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { jobId: job.jobId, jobType: job.jobType } });
+    let lastEvent = triggered;
+    let deliveries = [];
+    const nextState = mergeRuntimePatch(snapshot.state || {}, statePatch);
+    let nativeMutated = false;
+    if (nativeMessageSpec) {
+      const committed = authorityStore.runtimeV2.commitMessage(nativeMessageSpec);
+      message = committed.message;
+      nativeMutated ||= committed.created;
+      recentMessages = runtimeV2Reader.listRecentMessages({ charId: job.characterId, limit: 200 }).filter((item) => isChatRuntimeMessage(item)).slice(-100);
+    }
+    if (contentHash(nextState) !== contentHash(snapshot.state || {})) {
+      let entityVersion = snapshot.snapshotVersion + 1;
+      if (nativeAuthority) {
+        const currentState = authorityStore.runtimeV2.getCharacterState(job.characterId);
+        const savedState = authorityStore.runtimeV2.putCharacterState(job.characterId, nextState, { expectedVersion: currentState?.version || 0 });
+        if (savedState.changed) authorityStore.runtimeV2.appendStateEvent(job.characterId, savedState.state.version, { patch: statePatch, source: "scheduled-job", jobId: job.jobId }, job.commandId);
+        nativeMutated ||= savedState.changed;
+        entityVersion = savedState.state.version;
+      }
+      lastEvent = authorityStore.appendEvent({ commandId: job.commandId, type: "character.state.updated", characterId: job.characterId, entityVersion, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { jobId: job.jobId, patch: statePatch } });
+    }
+    if (message) {
+      lastEvent = authorityStore.appendEvent({ commandId: job.commandId, type: "message.proactive.created", characterId: job.characterId, occurredAt: new Date(message.occurredAt || message.timestamp).toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { jobId: job.jobId, message } });
+      deliveries = authorityStore.enqueueOutboxForEvent(lastEvent.eventId, Array.isArray(payload.deliveryTargets) ? payload.deliveryTargets : []).map((item) => item.deliveryId);
+    }
+    const snapshotEvent = authorityStore.appendEvent({ commandId: job.commandId, type: "character.snapshot.updated", characterId: job.characterId, entityVersion: snapshot.snapshotVersion + 1, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { reason: "scheduled.action.completed", jobId: job.jobId, lastActionEventId: lastEvent.eventId } });
+    const nextSnapshot = authorityStore.putSnapshot(job.characterId, { ...snapshot, lastEventId: snapshotEvent.eventId, state: nextState, recentMessages }, { expectedVersion: snapshot.snapshotVersion });
+    const completed = authorityStore.completeScheduledJob(job.jobId);
+    if (nativeMutated) authorityStore.runtimeV2.bumpNativeMutationSequence();
+    return { status: "completed", job: completed, snapshot: nextSnapshot, message, eventId: snapshotEvent.eventId, deliveries };
+  });
+  if (nativeAuthority) {
+    runtimeDataCache = loadMessageRuntime();
+    hubDataCache = materializeHubState(loadHubRuntimeDomains());
+  }
+  return result;
+}
+
+let actionRuntimeRunning = false;
+async function runActionRuntimeTick({ limit = 20 } = {}) {
+  if (actionRuntimeRunning) return { skipped: true, reason: "tick-already-running", claimed: 0, results: [] };
+  actionRuntimeRunning = true;
+  const results = [];
+  try {
+    const jobs = authorityStore.transaction(() => authorityStore.claimDueJobs({ limit }));
+    for (const job of jobs) {
+      try { results.push({ jobId: job.jobId, ...(await executeScheduledJob(job)) }); }
+      catch (error) {
+        const failed = authorityStore.transaction(() => {
+          authorityStore.appendEvent({ commandId: job.commandId, type: "schedule.failed", characterId: job.characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { jobId: job.jobId, error: String(error?.message || error) } });
+          return authorityStore.failScheduledJob(job.jobId, error?.message || error);
+        });
+        results.push({ jobId: job.jobId, status: failed.status, error: failed.lastError });
+      }
+    }
+    return { skipped: false, claimed: jobs.length, results };
+  } finally {
+    actionRuntimeRunning = false;
+  }
+}
+
 async function handleApi(req, res, pathname) {
   if (req.method === "OPTIONS") return send(res, 204, "");
   if (!isPublicApi(pathname) && !authorized(req)) {
@@ -4168,7 +5003,588 @@ async function handleApi(req, res, pathname) {
       publicUrl: PUBLIC_BASE_URL,
       dataDir: DATA_DIR,
       authRequired: Boolean(HUB_TOKEN),
+      protocolVersion: PROTOCOL_VERSION,
+      runtimeRead: runtimeReadMode.publicStatus(),
+      runtimeNativeWritesEnabled: RUNTIME_NATIVE_WRITES_ENABLED,
     });
+  }
+
+  if (pathname === "/api/contracts" && req.method === "GET") {
+    return send(req, res, 200, {
+      ok: true,
+      contract: contractManifest,
+      runtime: {
+        mode: "independent-character-runtime",
+        authority: "memory-hub",
+        persistence: "authority.sqlite runtime domains",
+        commandBus: "implemented",
+        eventLog: "implemented",
+        snapshots: "implemented",
+        realtimeTransport: "planned",
+      },
+      capabilities: {
+        implemented: [
+          "memory.runtime.v1",
+          "memory.recall.v1",
+          "sullyos.import.v1",
+          "contract.discovery.v1",
+          "contract.validation.v1",
+          "character.authority.v1",
+          "user-profile.authority.v1",
+          "world.authority.v1",
+          "worldbook.authority.v1",
+          "worldbook.mounts.v1",
+          "sullyos.full-migration.v1",
+          "authority.audit.v1",
+          "context.parity.preview.v1",
+          "context.assemble.v1",
+          "unified-state.sqlite.v1",
+          "independent-runtime.v1",
+          "command-bus.v1",
+          "event-stream.v1",
+          "snapshot.v1",
+          "chat-turn-execution.v1",
+          "sullyos-chat-compat.v1",
+          "character-state-reducer.v1",
+          "scheduled-action-runtime.v1",
+          "outbox-delivery.v1"
+        ],
+        planned: ["model-generated-proactive-actions.v1"]
+      }
+    });
+  }
+
+  if (pathname.startsWith("/api/contracts/schemas/") && req.method === "GET") {
+    const name = decodeURIComponent(pathname.slice("/api/contracts/schemas/".length));
+    const schema = contractSchemas[name];
+    if (!schema) return send(req, res, 404, { ok: false, code: "NOT_FOUND", error: `Unknown contract schema: ${name}` });
+    return send(req, res, 200, { ok: true, name, packageVersion: CONTRACT_PACKAGE_VERSION, protocolVersion: PROTOCOL_VERSION, schema });
+  }
+
+  if (pathname === "/api/contracts/validate" && req.method === "POST") {
+    const body = await readBody(req);
+    const protocolVersion = clean(body.protocolVersion || PROTOCOL_VERSION);
+    if (!SUPPORTED_PROTOCOL_VERSIONS.includes(protocolVersion)) {
+      return send(req, res, 400, {
+        ok: false,
+        code: "PROTOCOL_VERSION_UNSUPPORTED",
+        error: `Unsupported protocol version: ${protocolVersion}`,
+        supportedProtocolVersions: SUPPORTED_PROTOCOL_VERSIONS,
+      });
+    }
+    const result = validateContract(clean(body.schema), body.data);
+    return send(req, res, result.ok ? 200 : 400, {
+      ...result,
+      schema: clean(body.schema),
+      protocolVersion,
+      ...(result.ok ? {} : { code: "VALIDATION_FAILED", error: "Contract validation failed" }),
+    });
+  }
+
+  if (pathname === "/api/v1/compat/sully" && req.method === "GET") {
+    return send(req, res, 200, sullyCompatibilityDescriptor());
+  }
+
+  if (pathname === "/api/v1/compat/sully/chat/preview" && req.method === "POST") {
+    const adapted = normalizeSullyChatTurnRequest(await readBody(req));
+    return send(req, res, 200, { ok: true, ...adapted });
+  }
+
+  if (pathname === "/api/v1/cc/context" && req.method === "POST") {
+    if (authorityStore.runtimeV2.authorityMode() !== "v2") throw new AuthorityError("V2_AUTHORITY_NOT_PROMOTED", "CC context requires V2 authority", 409);
+    const body = await readBody(req), characterId = clean(body.characterId || body.charId);
+    return send(req, res, 200, { ok: true, context: await buildCcContextPackage(characterId, { reason: clean(body.reason || "manual"), recallLimit: body.recallLimit, forceStable: body.forceStable === true, sessionId: clean(body.sessionId) || null }) });
+  }
+
+  if (pathname === "/api/v1/cc/wakes/claim" && req.method === "POST") {
+    if (authorityStore.runtimeV2.authorityMode() !== "v2") throw new AuthorityError("V2_AUTHORITY_NOT_PROMOTED", "CC wake claims require V2 authority", 409);
+    const body = await readBody(req);
+    const wakeRun = authorityStore.transaction(() => authorityStore.runtimeV2.claimCcWakeRun({ characterId: clean(body.characterId || body.charId), leaseMs: body.leaseMs }));
+    if (!wakeRun) return send(req, res, 200, { ok: true, wakeRun: null, context: null });
+    // Reclaimed/retried wakes reuse the exact first claim context. This keeps the
+    // stable personality block and cursor boundary intact across runner crashes.
+    const context = wakeRun.context || await buildCcContextPackage(wakeRun.characterId, { wakeRun, leaseToken: wakeRun.leaseToken, reason: wakeRun.wakeReason, recallLimit: body.recallLimit, forceStable: body.forceStable === true, sessionId: clean(body.sessionId || wakeRun.sessionId) || null });
+    return send(req, res, 200, { ok: true, wakeRun: authorityStore.runtimeV2.getCcWakeRun(wakeRun.wakeRunId), context });
+  }
+
+  const ccWakeFailMatch = pathname.match(/^\/api\/v1\/cc\/wakes\/([^/]+)\/fail$/);
+  if (ccWakeFailMatch && req.method === "POST") {
+    const body = await readBody(req), wakeRunId = decodeURIComponent(ccWakeFailMatch[1]);
+    const wakeRun = authorityStore.transaction(() => {
+      const updated = body.retry === true
+        ? authorityStore.runtimeV2.retryCcWakeRun(wakeRunId, clean(body.leaseToken), clean(body.error || "CC wake will be retried"))
+        : authorityStore.runtimeV2.completeCcWakeRun(wakeRunId, clean(body.leaseToken), { error: clean(body.error || "CC wake failed") });
+      authorityStore.runtimeV2.putCcSession(updated.characterId, { status: "idle" });
+      return updated;
+    });
+    return send(req, res, 200, { ok: true, wakeRun });
+  }
+
+  if ((pathname === "/api/v1/scheduled-jobs" || pathname === "/v1/scheduled-jobs") && req.method === "POST") {
+    const body = await readBody(req);
+    const characterId = clean(body.characterId || body.charId || "");
+    await ensureCharacterSnapshot(characterId);
+    const outcome = authorityStore.transaction(() => {
+      const created = authorityStore.createScheduledJob({ ...body, characterId });
+      if (created.created) authorityStore.appendEvent({ commandId: created.job.commandId, type: "schedule.created", characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { jobId: created.job.jobId, jobType: created.job.jobType, dueAt: created.job.dueAt } });
+      return created;
+    });
+    return send(req, res, outcome.created ? 201 : 200, { ok: true, idempotentReplay: !outcome.created, ...outcome });
+  }
+
+  if ((pathname === "/api/v1/scheduled-jobs" || pathname === "/v1/scheduled-jobs") && req.method === "GET") {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const jobs = authorityStore.listScheduledJobs({ characterId: clean(url.searchParams.get("characterId") || ""), status: clean(url.searchParams.get("status") || ""), limit: url.searchParams.get("limit") || 200 });
+    return send(req, res, 200, { ok: true, jobs });
+  }
+
+  const scheduledJobMatch = pathname.match(/^\/(?:api\/)?v1\/scheduled-jobs\/([^/]+)$/);
+  if (scheduledJobMatch && req.method === "GET") {
+    const job = authorityStore.getScheduledJob(decodeURIComponent(scheduledJobMatch[1]));
+    if (!job) throw new AuthorityError("NOT_FOUND", "scheduled job was not found", 404);
+    return send(req, res, 200, { ok: true, job });
+  }
+  if (scheduledJobMatch && req.method === "DELETE") {
+    const job = authorityStore.transaction(() => {
+      const cancelled = authorityStore.cancelScheduledJob(decodeURIComponent(scheduledJobMatch[1]));
+      authorityStore.appendEvent({ commandId: cancelled.commandId, type: "schedule.cancelled", characterId: cancelled.characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { jobId: cancelled.jobId } });
+      return cancelled;
+    });
+    return send(req, res, 200, { ok: true, job });
+  }
+
+  if ((pathname === "/api/v1/runtime/tick" || pathname === "/v1/runtime/tick") && req.method === "POST") {
+    const body = await readBody(req);
+    return send(req, res, 200, { ok: true, ...(await runActionRuntimeTick({ limit: body.limit || 20 })) });
+  }
+
+  if ((pathname === "/api/v1/outbox" || pathname === "/v1/outbox") && req.method === "GET") {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const clientId = clean(url.searchParams.get("clientId") || "");
+    if (!clientId) throw new AuthorityError("VALIDATION_FAILED", "clientId is required", 400);
+    const deliveries = authorityStore.transaction(() => authorityStore.claimOutboxDeliveries(clientId, { after: url.searchParams.get("after") || 0, limit: url.searchParams.get("limit") || 100 }));
+    return send(req, res, 200, { ok: true, clientId, deliveries });
+  }
+
+  const outboxActionMatch = pathname.match(/^\/(?:api\/)?v1\/outbox\/([^/]+)\/(ack|retry)$/);
+  if (outboxActionMatch && req.method === "POST") {
+    const body = await readBody(req);
+    const deliveryId = decodeURIComponent(outboxActionMatch[1]);
+    const action = outboxActionMatch[2];
+    const clientId = clean(body.clientId || "");
+    if (!clientId) throw new AuthorityError("VALIDATION_FAILED", "clientId is required", 400);
+    const delivery = authorityStore.transaction(() => action === "ack"
+      ? authorityStore.acknowledgeOutboxDelivery(clientId, deliveryId)
+      : authorityStore.retryOutboxDelivery(clientId, deliveryId, body.error));
+    return send(req, res, 200, { ok: true, delivery });
+  }
+
+  if ((pathname === "/api/v1/commands" || pathname === "/v1/commands") && req.method === "POST") {
+    const command = normalizeHubCommand(await readBody(req));
+    requireValidContract("command", command);
+    if (!SUPPORTED_PROTOCOL_VERSIONS.includes(command.protocolVersion)) throw new AuthorityError("PROTOCOL_VERSION_UNSUPPORTED", `Unsupported protocol version: ${command.protocolVersion}`, 400);
+    const outcome = authorityStore.transaction(() => {
+      const created = authorityStore.createCommand(command);
+      if (!created.created) return { created: false, command: created.command, events: authorityStore.listEvents({ after: 0, limit: 1000 }).filter((event) => event.commandId === command.commandId) };
+      const event = authorityStore.appendEvent({ commandId: command.commandId, type: "command.accepted", characterId: command.characterId, worldId: command.worldId, occurredAt: new Date().toISOString(), protocolVersion: command.protocolVersion, payload: { commandType: command.type, actorId: command.actorId } });
+      return { created: true, command: created.command, events: [event] };
+    });
+    return send(req, res, outcome.created ? 202 : 200, { ok: true, idempotentReplay: !outcome.created, ...outcome });
+  }
+
+  if ((pathname === "/api/v1/runtime/commands" || pathname === "/v1/runtime/commands") && req.method === "POST") {
+    if (!RUNTIME_NATIVE_WRITES_ENABLED) throw new AuthorityError("V2_NATIVE_WRITE_DISABLED", "V2 native writes are disabled; set MEMORY_HUB_RUNTIME_NATIVE_WRITES_ENABLED=true only after V2 read promotion", 409);
+    if (authorityStore.runtimeV2.authorityMode() !== "v2") throw new AuthorityError("V2_AUTHORITY_NOT_PROMOTED", "V2 native writes require a persisted V2 authority promotion", 409, { authorityMode: authorityStore.runtimeV2.authorityMode() });
+    if (!useV2RuntimeReads()) throw new AuthorityError("V2_NATIVE_READ_REQUIRED", "V2 native writes require an effective V2 runtime read mode", 409, runtimeReadMode.publicStatus());
+    const command = normalizeHubCommand(await readBody(req));
+    requireValidContract("command", command);
+    if (!SUPPORTED_PROTOCOL_VERSIONS.includes(command.protocolVersion)) throw new AuthorityError("PROTOCOL_VERSION_UNSUPPORTED", `Unsupported protocol version: ${command.protocolVersion}`, 400);
+    const outcome = runtimeNativeCommands.execute(command);
+    if (!outcome.idempotentReplay && ["runtime.message.commit", "runtime.activity.commit"].includes(command.type)) runtimeDataCache = loadMessageRuntime();
+    if (!outcome.idempotentReplay && /^(?:memory\.(?:node|vector|link|event_box|room_plate|digest)|runtime\.(?:anticipation|activity)|character\.state)\./.test(command.type)) hubDataCache = materializeHubState(loadHubRuntimeDomains());
+    return send(req, res, outcome.idempotentReplay ? 200 : 201, { ok: true, ...outcome });
+  }
+
+  if ((pathname === "/api/runtime/v2/promotion" || pathname === "/api/v1/runtime/promotion") && req.method === "GET") {
+    return send(req, res, 200, { ok: true, ...runtimeV2Promotion.status(), readMode: runtimeReadMode.publicStatus(), nativeWritesEnabled: RUNTIME_NATIVE_WRITES_ENABLED });
+  }
+
+  if ((pathname === "/api/runtime/v2/promotion/prepare" || pathname === "/api/v1/runtime/promotion/prepare") && req.method === "POST") {
+    if (!useV2RuntimeReads()) throw new AuthorityError("V2_PROMOTION_READ_MODE_REQUIRED", "Promotion preparation requires a healthy effective V2 read mode", 409, runtimeReadMode.publicStatus());
+    const body = await readBody(req);
+    const promotion = runtimeV2Promotion.prepare({ actorId: clean(body.actorId || "operator") });
+    return send(req, res, 201, { ok: true, promotion });
+  }
+
+  if ((pathname === "/api/runtime/v2/promotion/commit" || pathname === "/api/v1/runtime/promotion/commit") && req.method === "POST") {
+    if (!useV2RuntimeReads()) throw new AuthorityError("V2_PROMOTION_READ_MODE_REQUIRED", "Promotion commit requires a healthy effective V2 read mode", 409, runtimeReadMode.publicStatus());
+    const body = await readBody(req);
+    const status = runtimeV2Promotion.commit(clean(body.promotionId), clean(body.parityHash), { actorId: clean(body.actorId || "operator") });
+    return send(req, res, 200, { ok: true, ...status, readMode: runtimeReadMode.publicStatus() });
+  }
+
+  if ((pathname === "/api/runtime/v2/promotion/rollback" || pathname === "/api/v1/runtime/promotion/rollback") && req.method === "POST") {
+    const body = await readBody(req);
+    const status = runtimeV2Promotion.rollback({ actorId: clean(body.actorId || "operator"), reason: clean(body.reason || "operator rollback") });
+    runtimeReadMode.initialize();
+    return send(req, res, 200, { ok: true, ...status, readMode: runtimeReadMode.publicStatus() });
+  }
+
+  if ((pathname === "/api/v1/chat/turns" || pathname === "/v1/chat/turns" || pathname === "/api/v1/compat/sully/chat/turns") && req.method === "POST") {
+    const rawBody = await readBody(req);
+    const adapted = pathname === "/api/v1/compat/sully/chat/turns" ? normalizeSullyChatTurnRequest(rawBody) : null;
+    const body = adapted?.request || rawBody;
+    const characterId = clean(body.characterId || body.charId || "");
+    const content = clean(body.message?.content || body.content || body.text || "");
+    if (!characterId || !content) throw new AuthorityError("VALIDATION_FAILED", "characterId and message content are required", 400);
+    const command = normalizeHubCommand(body.command || body, { type: "chat.turn.submit", characterId, actorId: body.actorId || "sullyos-client", payload: { content, message: body.message || null } });
+    command.type = "chat.turn.submit";
+    command.characterId = characterId;
+    command.payload = { ...(command.payload || {}), content, message: body.message || null };
+    requireValidContract("command", command);
+
+    const admitted = authorityStore.transaction(() => {
+      const created = authorityStore.createCommand(command);
+      if (created.created) authorityStore.appendEvent({ commandId: command.commandId, type: "command.accepted", characterId, occurredAt: new Date().toISOString(), protocolVersion: command.protocolVersion, payload: { commandType: command.type, actorId: command.actorId } });
+      return created;
+    });
+    if (!admitted.created && admitted.command.status === "completed") return send(req, res, 200, { ok: true, idempotentReplay: true, ...(adapted ? { compatibility: adapted.compatibility } : {}), command: admitted.command, ...(admitted.command.result || {}) });
+    if (!admitted.created && admitted.command.status === "failed") return send(req, res, 409, { ok: false, idempotentReplay: true, ...(adapted ? { compatibility: adapted.compatibility } : {}), command: admitted.command, error: admitted.command.error });
+    const started = authorityStore.startCommand(command.commandId);
+    if (!started.started) throw new AuthorityError("COMMAND_IN_PROGRESS", "Command is already being processed", 409, { commandId: command.commandId, status: started.command?.status });
+
+    try {
+      const data = await readJsonFile(DATA_FILE, EMPTY_DATA);
+      const character = (data.characters || []).find((item) => clean(item.id || item.characterId) === characterId);
+      if (!character) throw new AuthorityError("NOT_FOUND", `character ${characterId} was not found`, 404);
+      const admittedSnapshot = authorityStore.getSnapshot(characterId);
+      if (command.expectedVersion !== undefined && Number(command.expectedVersion) !== Number(admittedSnapshot?.snapshotVersion || 0)) {
+        throw new AuthorityError("VERSION_CONFLICT", "Character snapshot version conflict", 409, { currentVersion: admittedSnapshot?.snapshotVersion || 0 });
+      }
+      const runtime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
+      const conversationId = clean(body.conversationId || body.message?.conversationId || `direct:me:${characterId}`);
+      const userAppend = appendRuntimeMessages(runtime, characterId, [{ ...(body.message || {}), sourceId: clean(body.message?.sourceId || "") || `${command.commandId}:user`, role: "user", content, timestamp: Number(body.message?.timestamp || body.now || Date.now()), surface: "chat", visibility: "user", conversationId, origin: "user", metadata: { ...(body.message?.metadata || {}), commandId: command.commandId, authority: "memory-hub" } }]);
+      await writeJsonFile(RUNTIME_FILE, runtime);
+      const userMessage = userAppend.appended[0] || userAppend.updated[0];
+      const userEvent = authorityStore.appendEvent({ commandId: command.commandId, type: "message.user.created", characterId, occurredAt: new Date(userMessage.timestamp).toISOString(), protocolVersion: command.protocolVersion, payload: { message: userMessage } });
+
+      const assembled = await requestAssembledContext(characterId, body);
+      const settings = { ...DEFAULT_SETTINGS, ...(await readJsonFile(SETTINGS_FILE, DEFAULT_SETTINGS)) };
+      const config = resolveChatTurnConfig(body, data, settings);
+      if (!config.baseUrl || !config.model) throw new AuthorityError("MODEL_CONFIG_MISSING", "Hub chat model baseUrl and model are required", 400);
+      const completion = await callMemoryPalaceLLM(config, assembled.finalMessages, { temperature: body.temperature, maxTokens: body.maxTokens || body.max_tokens, timeoutMs: body.timeoutMs || 180000 });
+      const assistantContent = clean(completion.reply || "");
+      if (!assistantContent) throw new AuthorityError("MODEL_EMPTY_RESPONSE", "Chat model returned an empty response", 502);
+
+      const freshRuntime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
+      const assistantAppend = appendRuntimeMessages(freshRuntime, characterId, [{ sourceId: `${command.commandId}:assistant`, role: "assistant", content: assistantContent, timestamp: Date.now(), surface: "chat", visibility: "user", conversationId, origin: "character", metadata: { commandId: command.commandId, authority: "memory-hub", model: config.model } }]);
+      await writeJsonFile(RUNTIME_FILE, freshRuntime);
+      const assistantMessage = assistantAppend.appended[0] || assistantAppend.updated[0];
+      let snapshot;
+      const emitted = authorityStore.transaction(() => {
+        const assistantEvent = authorityStore.appendEvent({ commandId: command.commandId, type: "message.assistant.created", characterId, occurredAt: new Date(assistantMessage.timestamp).toISOString(), protocolVersion: command.protocolVersion, payload: { message: assistantMessage, model: config.model } });
+        const previous = authorityStore.getSnapshot(characterId);
+        const snapshotEvent = authorityStore.appendEvent({ commandId: command.commandId, type: "character.snapshot.updated", characterId, entityVersion: Number(previous?.snapshotVersion || 0) + 1, occurredAt: new Date().toISOString(), protocolVersion: command.protocolVersion, payload: { reason: "chat.turn.completed", assistantEventId: assistantEvent.eventId } });
+        snapshot = authorityStore.putSnapshot(characterId, { lastEventId: snapshotEvent.eventId, protocolVersion: command.protocolVersion, character, user: authorityStore.getEntity("userProfile", clean(body.userId || "me"))?.data || character.userProfile || null, world: previous?.world || null, state: previous?.state || data.characterRuntime?.[characterId] || {}, recentMessages: freshRuntime.messages.filter((item) => item.charId === characterId && isChatRuntimeMessage(item)).slice(-100) }, { expectedVersion: command.expectedVersion ?? previous?.snapshotVersion ?? 0 });
+        const result = { commandId: command.commandId, userEventId: userEvent.eventId, assistantEventId: assistantEvent.eventId, snapshotEventId: snapshotEvent.eventId, assistantMessage, snapshot, context: body.includeContext ? assembled : undefined };
+        authorityStore.finishCommand(command.commandId, { status: "completed", result });
+        return { assistantEvent, snapshotEvent, result };
+      });
+      return send(req, res, 201, { ok: true, idempotentReplay: false, ...(adapted ? { compatibility: adapted.compatibility } : {}), command: authorityStore.getCommand(command.commandId), ...emitted.result });
+    } catch (error) {
+      const normalized = error instanceof AuthorityError ? error : new AuthorityError("CHAT_TURN_FAILED", String(error?.message || error), 502);
+      authorityStore.transaction(() => {
+        authorityStore.appendEvent({ commandId: command.commandId, type: "command.failed", characterId, occurredAt: new Date().toISOString(), protocolVersion: command.protocolVersion, payload: { code: normalized.code, error: normalized.message } });
+        authorityStore.finishCommand(command.commandId, { status: "failed", error: { code: normalized.code, message: normalized.message, details: normalized.details } });
+      });
+      throw normalized;
+    }
+  }
+
+  if ((pathname === "/api/v1/events" || pathname === "/v1/events") && req.method === "GET") {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const after = Math.max(0, Number(url.searchParams.get("after") || 0) || 0);
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit") || 200) || 200));
+    const characterId = clean(url.searchParams.get("characterId") || "");
+    const clientId = clean(url.searchParams.get("clientId") || "");
+    const requestedSurface = normalizeRuntimeSurface(url.searchParams.get("surface") || "");
+    const requestedVisibility = clean(url.searchParams.get("visibility") || "").toLowerCase();
+    const candidates = authorityStore.listEvents({ after, limit: requestedSurface || requestedVisibility ? 1000 : limit, characterId }).map(decorateHubEvent);
+    const events = candidates.filter((event) => (!requestedSurface || event.surface === requestedSurface) && (!requestedVisibility || event.visibility === requestedVisibility)).slice(0, limit);
+    const lastEventId = events.at(-1)?.eventId || after;
+    const cursor = clientId ? authorityStore.advanceClientCursor(clientId, lastEventId) : null;
+    const surfaceCounts = Object.fromEntries([...RUNTIME_SURFACES].map((surface) => [surface, candidates.filter((event) => event.surface === surface).length]));
+    return send(req, res, 200, { ok: true, after, lastEventId, hasMore: events.length === limit, surface: requestedSurface || null, visibility: requestedVisibility || null, surfaceCounts, events, cursor: cursor ? { clientId: cursor.client_id, lastEventId: Number(cursor.last_event_id), updatedAt: cursor.updated_at } : null });
+  }
+
+  const snapshotMatch = pathname.match(/^\/(?:api\/)?v1\/characters\/([^/]+)\/snapshot$/);
+  if (snapshotMatch && req.method === "GET") {
+    const characterId = decodeURIComponent(snapshotMatch[1]);
+    let snapshot = authorityStore.getSnapshot(characterId);
+    if (!snapshot) {
+      const data = await readJsonFile(DATA_FILE, EMPTY_DATA);
+      const runtime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
+      const character = (data.characters || []).find((item) => clean(item.id || item.characterId) === characterId);
+      if (!character) throw new AuthorityError("NOT_FOUND", `character ${characterId} was not found`, 404);
+      const user = authorityStore.getEntity("userProfile", "me")?.data || character.userProfile || null;
+      const recentMessages = runtime.messages.filter((item) => item.charId === characterId && isChatRuntimeMessage(item)).slice(-100);
+      snapshot = authorityStore.transaction(() => {
+        const event = authorityStore.appendEvent({ type: "character.snapshot.initialized", characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { source: "runtime" } });
+        return authorityStore.putSnapshot(characterId, { lastEventId: event.eventId, protocolVersion: PROTOCOL_VERSION, character, user, world: null, state: data.characterRuntime?.[characterId] || {}, recentMessages });
+      });
+    }
+    snapshot = { ...snapshot, recentMessages: (snapshot.recentMessages || []).filter((item) => isChatRuntimeMessage(item)) };
+    requireValidContract("snapshot", snapshot);
+    return send(req, res, 200, { ok: true, snapshot });
+  }
+
+  if (pathname === "/api/v1/context/preview" && req.method === "POST") {
+    const body = await readBody(req);
+    const input = { ...(body.fixture || body) };
+    if (body.recallQuery && body.memoryState) {
+      const settings = await readJsonFile(SETTINGS_FILE, DEFAULT_SETTINGS);
+      const recalled = await recallHubData(settings, normalizeData(body.memoryState), {
+        query: clean(body.recallQuery),
+        charId: clean(input.character?.id || input.character?.characterId || body.charId),
+        userName: clean(input.userProfile?.name || "用户"),
+        limit: body.recallLimit || 15,
+        candidateLimit: body.candidateLimit || 50,
+        eventBoxMode: clean(body.eventBoxMode || settings.recallEventBoxMode || "compat"),
+        now: body.now ?? input.now,
+      });
+      input.memoryPalaceContext = recalled.memoryPalaceContext || "";
+      input.roomPlatesContext = recalled.roomPlatesContext || input.roomPlatesContext || "";
+      input.recallResult = {
+        mode: recalled.mode,
+        items: recalled.items || [],
+        candidates: recalled.trace?.candidates || [],
+        memoryPalaceContext: recalled.memoryPalaceContext || "",
+      };
+      input.stateChanges = recalled.stateChanges || [];
+    }
+    return send(req, res, 200, { ok: true, promptSource: "SullyOS utils/context.ts:107 + utils/worldbook.ts", ...buildContextParity(input) });
+  }
+
+  if (pathname === "/api/v1/context/assemble" && req.method === "POST") {
+    const body = await readBody(req);
+    const characterId = clean(body.characterId || body.charId || "");
+    if (!characterId) throw new AuthorityError("VALIDATION_FAILED", "characterId is required", 400);
+    const data = await readJsonFile(DATA_FILE, EMPTY_DATA);
+    const runtime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
+    const character = (data.characters || []).find((item) => clean(item.id || item.characterId) === characterId);
+    if (!character) throw new AuthorityError("NOT_FOUND", `character ${characterId} was not found`, 404);
+    const userRecord = authorityStore.getEntity("userProfile", clean(body.userId || "me"));
+    const userProfile = userRecord?.data || character.userProfile || { name: clean(body.userName || "用户"), bio: clean(body.userBio || "") };
+    const runtimeSnapshot = authorityStore.getSnapshot(characterId);
+    const contextCharacter = {
+      ...character,
+      vrState: { ...(character.vrState || {}), ...(runtimeSnapshot?.state?.vrState || {}) },
+    };
+    const historyLimit = Math.max(1, Math.min(1000, Number(body.historyLimit || character.contextLimit || 100) || 100));
+    const conversationId = clean(body.conversationId || `direct:me:${characterId}`);
+    const messages = runtime.messages
+      .filter((item) => item.charId === characterId && (isChatRuntimeMessage(item, conversationId) || isVrCardRuntimeMessage(item)))
+      .slice(-historyLimit)
+      .map((item) => isVrCardRuntimeMessage(item)
+        ? formatSullyVrCardMessage(item, contextCharacter)
+        : { role: item.role, content: item.content ?? item.text ?? "", id: item.id, timestamp: item.timestamp });
+    const query = clean(body.query || messages.slice(-12).map((item) => clean(item.content)).filter(Boolean).join("\n"));
+    let recalled = { items: [], memoryPalaceContext: "", roomPlatesContext: "" };
+    if (character.memoryPalaceEnabled && query) {
+      const settings = { ...DEFAULT_SETTINGS, ...(await readJsonFile(SETTINGS_FILE, DEFAULT_SETTINGS)) };
+      recalled = await recallHubData(settings, data, {
+        charId: characterId,
+        userName: clean(userProfile.name || "用户"),
+        query,
+        limit: Math.max(1, Math.min(30, Number(body.recallLimit || 15) || 15)),
+        candidateLimit: Math.max(10, Math.min(200, Number(body.candidateLimit || 50) || 50)),
+        eventBoxMode: clean(body.eventBoxMode || settings.recallEventBoxMode || "compat"),
+        eventBoxLiveLimit: Number(body.eventBoxLiveLimit || settings.recallEventBoxLiveLimit || 5),
+        persistState: true,
+        now: body.now,
+      });
+    }
+    const roomPlatesContext = recalled.roomPlatesContext || formatRoomPlatesContext((data.roomPlates || []).filter((item) => item.charId === characterId), clean(userProfile.name || "用户"));
+    const scheduleRuntime = buildHubScheduleRuntimeContext(data, contextCharacter, runtimeSnapshot, body.now ?? Date.now());
+    const assembled = buildContextParity({
+      character: contextCharacter,
+      userProfile,
+      messages,
+      memoryPalaceContext: recalled.memoryPalaceContext || "",
+      roomPlatesContext,
+      recallResult: { mode: recalled.mode || "none", items: recalled.items || [], candidates: recalled.trace?.candidates || [], memoryPalaceContext: recalled.memoryPalaceContext || "" },
+      stateChanges: recalled.stateChanges || [],
+      runtimeStateContext: scheduleRuntime.text,
+      now: body.now || Date.now(),
+      lastInteractionTs: messages.length > 1 ? messages[messages.length - 2]?.timestamp : undefined,
+      modelConfig: data.modelConfig || {},
+    });
+    const mountedWorldbooks = Array.isArray(character.mountedWorldbooks) ? character.mountedWorldbooks : [];
+    const sourceBlocks = [
+      { key: "character", title: "角色人设", source: "authority.sqlite · CharacterDefinition", editable: true, target: "characters", enabled: true, content: clean(character.systemPrompt || "") },
+      { key: "worldview", title: "世界观", source: "authority.sqlite · CharacterDefinition.worldview", editable: true, target: "characters", enabled: Boolean(clean(character.worldview || "")), content: clean(character.worldview || "") },
+      { key: "user", title: "User 档案", source: "authority.sqlite · UserIdentity", editable: true, target: "users", enabled: true, content: JSON.stringify(userProfile || {}, null, 2) },
+      { key: "impression", title: "私人印象", source: "authority.sqlite · CharacterDefinition.impression", editable: true, target: "characters", enabled: Boolean(character.impression), content: character.impression ? JSON.stringify(character.impression, null, 2) : "" },
+      { key: "legacy", title: "Legacy 月度记忆", source: "authority.sqlite · Character Runtime", editable: true, target: "coreMemories", enabled: Boolean(Object.keys(character.refinedMemories || {}).length || character.activeMemoryMonths?.length), content: JSON.stringify({ refinedMemories: character.refinedMemories || {}, activeMemoryMonths: character.activeMemoryMonths || [] }, null, 2) },
+      { key: "roomPlates", title: "RoomPlate 底色认知", source: "authority.sqlite · runtime_domains", editable: true, target: "plates", enabled: Boolean(clean(roomPlatesContext)), content: roomPlatesContext || "" },
+      { key: "recall", title: "Memory Palace Recall", source: "authority.sqlite · runtime memory", editable: false, target: "searchIndex", enabled: Boolean(clean(recalled.memoryPalaceContext || "")), content: recalled.memoryPalaceContext || "" },
+      { key: "runtime", title: "角色运行状态", source: "authority.sqlite · Character Runtime + SullyOS scheduleInjection.ts", editable: false, target: "runtimeCenter", enabled: true, content: JSON.stringify({ emotion: character.emotion, buffs: character.buffs, anticipations: character.anticipations, location: runtimeSnapshot?.state?.location ?? character.location, activity: runtimeSnapshot?.state?.activity ?? character.activity, lastActivity: runtimeSnapshot?.state?.lastActivity, vrState: contextCharacter.vrState, scheduleStyle: character.scheduleStyle, scheduleInjection: scheduleRuntime.text }, null, 2) },
+      { key: "worldbooks", title: "世界书", source: "authority.sqlite · Worldbook + mounts", editable: true, target: "worldbooks", enabled: mountedWorldbooks.length > 0, content: JSON.stringify({ mounted: mountedWorldbooks.map((book) => ({ id: book.worldbookId || book.id, title: book.title, position: book.position, order: book.order })), activated: assembled.activatedWorldbooks || [] }, null, 2) },
+      { key: "chatPrompt", title: "Chat Prompt", source: assembled.chatPromptParts?.source || "SullyOS utils/chatPrompts.ts", editable: false, target: "", enabled: Boolean(assembled.chatPromptParts?.stableRules || assembled.chatPromptParts?.recencyTail), content: [assembled.chatPromptParts?.stableRules, assembled.chatPromptParts?.recencyTail].filter(Boolean).join("\n\n") },
+    ];
+    return send(req, res, 200, {
+      ok: true,
+      authority: "memory-hub",
+      storage: "authority.sqlite",
+      characterId,
+      userId: userRecord?.entityId || clean(body.userId || "me"),
+      promptSource: "Memory Hub ContextAssembler parity port",
+      runtimeState: { schedule: scheduleRuntime.schedule, scheduleInjection: scheduleRuntime.text, wallNow: scheduleRuntime.wallNow.toISOString() },
+      sourceBlocks,
+      ...assembled,
+    });
+  }
+
+  const authorityCollections = {
+    characters: { type: "character", schema: "character", idField: "characterId" },
+    users: { type: "userProfile", schema: "userProfile", idField: "userId" },
+    worlds: { type: "world", schema: "world", idField: "worldId" },
+    worldbooks: { type: "worldbook", schema: "worldbook", idField: "worldbookId" },
+  };
+  const authorityMatch = pathname.match(/^\/api\/v1\/(characters|users|worlds|worldbooks)(?:\/([^/]+))?$/);
+  if (authorityMatch) {
+    const collection = authorityMatch[1];
+    const config = authorityCollections[collection];
+    const id = authorityMatch[2] ? decodeURIComponent(authorityMatch[2]) : "";
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const present = (record) => record ? {
+      ...record.data,
+      [config.idField]: record.entityId,
+      version: record.version,
+      updatedAt: record.updatedAt,
+      deletedAt: record.deletedAt,
+      sourceAuthority: record.sourceAuthority,
+      _hash: record.hash,
+      _fieldVersions: authorityStore.fieldVersions(config.type, record.entityId),
+    } : null;
+    const validate = (data, version) => {
+      const candidate = { ...data, [config.idField]: clean(data?.[config.idField] || data?.id || id), version, updatedAt: new Date().toISOString() };
+      const result = validateContract(config.schema, candidate);
+      if (!result.ok) throw new AuthorityError("VALIDATION_FAILED", `${config.schema} contract validation failed`, 400, { errors: result.errors });
+      return candidate;
+    };
+
+    if (!id && req.method === "GET") {
+      const items = authorityStore.listEntities(config.type, { includeDeleted: url.searchParams.get("includeDeleted") === "1", limit: url.searchParams.get("limit"), offset: url.searchParams.get("offset") }).map(present);
+      return send(req, res, 200, { ok: true, items, total: items.length });
+    }
+    if (!id && req.method === "POST") {
+      const body = await readBody(req);
+      const raw = body.data && typeof body.data === "object" ? body.data : body;
+      const entityId = clean(raw[config.idField] || raw.id);
+      if (!entityId) throw new AuthorityError("VALIDATION_FAILED", `${config.idField} is required`, 400);
+      const current = authorityStore.getEntity(config.type, entityId, { includeDeleted: true });
+      const data = validate(raw, Number(current?.version || 0) + 1);
+      delete data.version; delete data.updatedAt; delete data.deletedAt; delete data._hash; delete data._fieldVersions;
+      const record = authorityStore.transaction(() => authorityStore.putEntity(config.type, entityId, data, { expectedVersion: body.expectedVersion, actorId: clean(body.actorId || "api"), commandId: clean(body.commandId || "") || null, sourceAuthority: "hub" }));
+      if (config.type === "character" || config.type === "worldbook") refreshHubDataCache();
+      return send(req, res, current ? 200 : 201, { ok: true, item: present(record) });
+    }
+    if (!id) return send(req, res, 405, { ok: false, code: "VALIDATION_FAILED", error: "Method not allowed" });
+
+    if (req.method === "GET") {
+      const record = authorityStore.getEntity(config.type, id, { includeDeleted: url.searchParams.get("includeDeleted") === "1" });
+      if (!record) throw new AuthorityError("NOT_FOUND", `${config.type} ${id} was not found`, 404);
+      return send(req, res, 200, { ok: true, item: present(record) });
+    }
+    if (req.method === "PUT" || req.method === "PATCH") {
+      const body = await readBody(req);
+      const raw = body.data && typeof body.data === "object" ? body.data : body;
+      const current = authorityStore.getEntity(config.type, id);
+      if (!current && req.method === "PATCH") throw new AuthorityError("NOT_FOUND", `${config.type} ${id} was not found`, 404);
+      const metadataKeys = new Set(["expectedVersion", "actorId", "commandId", "unset", "protocolVersion"]);
+      const cleanRaw = Object.fromEntries(Object.entries(raw).filter(([key]) => !metadataKeys.has(key)));
+      const merged = req.method === "PATCH" ? { ...current.data, ...cleanRaw } : cleanRaw;
+      for (const key of body.unset || []) delete merged[key];
+      const data = validate(merged, Number(current?.version || 0) + 1);
+      delete data.version; delete data.updatedAt; delete data.deletedAt; delete data._hash; delete data._fieldVersions;
+      const record = authorityStore.transaction(() => authorityStore.putEntity(config.type, id, data, { expectedVersion: body.expectedVersion, actorId: clean(body.actorId || "api"), commandId: clean(body.commandId || "") || null, sourceAuthority: "hub", details: { unset: body.unset || [] } }));
+      if (config.type === "character" || config.type === "worldbook") refreshHubDataCache();
+      return send(req, res, current ? 200 : 201, { ok: true, item: present(record) });
+    }
+    if (req.method === "DELETE") {
+      const body = await readBody(req);
+      const record = authorityStore.transaction(() => authorityStore.deleteEntity(config.type, id, { expectedVersion: body.expectedVersion, actorId: clean(body.actorId || "api"), commandId: clean(body.commandId || "") || null }));
+      if (config.type === "character" || config.type === "worldbook") refreshHubDataCache();
+      return send(req, res, 200, { ok: true, tombstone: present(record) });
+    }
+  }
+
+  const mountMatch = pathname.match(/^\/api\/v1\/characters\/([^/]+)\/worldbooks(?:\/([^/]+))?$/);
+  if (mountMatch) {
+    const characterId = decodeURIComponent(mountMatch[1]);
+    const worldbookId = mountMatch[2] ? decodeURIComponent(mountMatch[2]) : "";
+    if (!worldbookId && req.method === "GET") return send(req, res, 200, { ok: true, items: authorityStore.listMounts(characterId, { includeDeleted: new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).searchParams.get("includeDeleted") === "1" }) });
+    if (!worldbookId) throw new AuthorityError("VALIDATION_FAILED", "worldbookId is required", 400);
+    const body = req.method === "POST" || req.method === "DELETE" ? await readBody(req) : {};
+    if (req.method === "POST") {
+      const item = authorityStore.transaction(() => authorityStore.mountWorldbook(characterId, worldbookId, { expectedVersion: body.expectedVersion, actorId: clean(body.actorId || "api"), commandId: clean(body.commandId || "") || null }));
+      refreshHubDataCache();
+      return send(req, res, 200, { ok: true, item });
+    }
+    if (req.method === "DELETE") {
+      const tombstone = authorityStore.transaction(() => authorityStore.unmountWorldbook(characterId, worldbookId, { expectedVersion: body.expectedVersion, actorId: clean(body.actorId || "api"), commandId: clean(body.commandId || "") || null }));
+      refreshHubDataCache();
+      return send(req, res, 200, { ok: true, tombstone });
+    }
+  }
+
+  if (pathname === "/api/v1/authority/stats" && req.method === "GET") return send(req, res, 200, { ok: true, ...authorityStore.stats() });
+  if (pathname === "/api/v1/audit" && req.method === "GET") {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    return send(req, res, 200, { ok: true, items: authorityStore.listAudit({ type: clean(url.searchParams.get("type") || ""), id: clean(url.searchParams.get("id") || ""), limit: url.searchParams.get("limit") }) });
+  }
+  if (pathname === "/api/v1/migrations/sully/preview" && req.method === "POST") {
+    const body = await readBody(req);
+    const source = body.backup || body.data || body;
+    return send(req, res, 200, { ok: true, mode: "preview", report: authorityStore.analyzeMigration(source), sourceHash: contentHash(source) });
+  }
+  if (pathname === "/api/v1/migrations/sully/import" && req.method === "POST") {
+    const body = await readBody(req);
+    const source = body.backup || body.data || body;
+    const report = authorityStore.importSullyBackup(source, { actorId: clean(body.actorId || "sullyos-migration"), mode: clean(body.mode || "import") });
+    const current = await readJsonFile(DATA_FILE, EMPTY_DATA, { allowCorruptFallback: true });
+    const unified = mergeSullyIntoHub(current, source);
+    const incomingCharacterIds = new Set((source.characters || []).map((item) => clean(item?.characterId || item?.charId || item?.id || "")).filter(Boolean));
+    const currentCharacters = new Map((current.characters || []).map((item) => [clean(item?.characterId || item?.id || ""), item]));
+    unified.characters = (unified.characters || []).map((item) => {
+      const id = clean(item?.characterId || item?.id || "");
+      return !incomingCharacterIds.has(id) && currentCharacters.has(id) ? currentCharacters.get(id) : item;
+    });
+    const archived = authorityStore.migrationObjectsByDomain();
+    for (const [domain, key] of Object.entries(MIGRATION_RUNTIME_FALLBACKS)) {
+      const items = archived[domain] || [];
+      if (!items.length) continue;
+      unified[key] = domain.endsWith("_state") || domain === "realtime_config" ? items[0] : items;
+    }
+    const runtime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
+    if ((archived.message || []).length) runtime.messages = archived.message;
+    runtime.nextMessageSeq = runtime.messages.reduce((max, item) => Math.max(max, Number(item?.id || 0) + 1), Math.max(Number(runtime.nextMessageSeq || 1), runtime.messages.length + 1));
+    authorityStore.transaction(() => {
+      persistHubRuntimeDomains(canonicalizeHubState(unified, "sullyos-migration"));
+      persistMessageRuntime(runtime);
+      authorityStore.clearMigrationObjects({ actorId: "sullyos-migration" });
+    });
+    hubDataCache = materializeHubState(loadHubRuntimeDomains());
+    runtimeDataCache = loadMessageRuntime();
+    return send(req, res, 201, { ok: true, report });
+  }
+  if (pathname === "/api/v1/migrations" && req.method === "GET") return send(req, res, 200, { ok: true, items: authorityStore.listMigrations(new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).searchParams.get("limit")) });
+  const migrationReportMatch = pathname.match(/^\/api\/v1\/migrations\/([^/]+)$/);
+  if (migrationReportMatch && req.method === "GET") {
+    const report = authorityStore.getMigration(decodeURIComponent(migrationReportMatch[1]));
+    if (!report) throw new AuthorityError("NOT_FOUND", "Migration report was not found", 404);
+    return send(req, res, 200, { ok: true, report });
   }
 
   if (pathname === "/api/config" && req.method === "GET") {
@@ -4647,7 +6063,7 @@ async function handleApi(req, res, pathname) {
     const storedSettings = await readJsonFile(SETTINGS_FILE, DEFAULT_SETTINGS);
     const settings = { ...DEFAULT_SETTINGS, ...storedSettings, ...(body.settings || {}) };
     const data = body.data ? normalizeData(body.data) : await readJsonFile(DATA_FILE, EMPTY_DATA);
-    const result = await recallHubData(settings, data, body);
+    const result = await recallHubData(settings, data, { ...body, persistState: !body.data && body.persistState !== false });
     return send(req, res, 200, result);
   }
 
@@ -4715,7 +6131,17 @@ async function handleApi(req, res, pathname) {
         "POST /api/sully/digest-reports",
         "GET /api/runtime/messages",
         "POST /api/runtime/messages",
+        "POST /api/v1/runtime/commands",
+        "GET /api/runtime/v2/promotion",
+        "POST /api/runtime/v2/promotion/prepare",
+        "POST /api/runtime/v2/promotion/commit",
+        "POST /api/runtime/v2/promotion/rollback",
+        "POST /api/v1/cc/context",
+        "POST /api/v1/cc/wakes/claim",
+        "POST /api/v1/cc/wakes/:id/fail",
         "GET /api/runtime/status",
+        "GET /api/runtime/storage",
+        "GET /api/runtime/v2/read-status",
         "POST /api/runtime/process",
         "GET /api/legacy/status",
         "GET /api/legacy/context",
@@ -4841,8 +6267,11 @@ async function handleApi(req, res, pathname) {
   if (pathname === "/api/legacy/recall" && req.method === "POST") {
     const body = await readBody(req);
     const charId = clean(body.charId || body.characterId || "");
-    const text = clean(body.text || body.content || body.directive || "");
-    if (!charId || !text) return send(req, res, 400, { ok: false, error: "charId and recall text are required" });
+    const requestedMonth = normalizeLegacyMonth(body.month || body.yearMonth || "");
+    const text = requestedMonth
+      ? `[[RECALL: ${requestedMonth}]]`
+      : clean(body.text || body.content || body.directive || "");
+    if (!charId || !text) return send(req, res, 400, { ok: false, error: "charId and recall month or text are required" });
     const data = await readJsonFile(DATA_FILE, EMPTY_DATA);
     const characterIndex = findCharacterIndex(data, charId);
     if (characterIndex < 0) return send(req, res, 404, { ok: false, error: "character not found" });
@@ -4876,7 +6305,7 @@ async function handleApi(req, res, pathname) {
       charId,
       charName: clean(character.name || charId),
       impression: normalizeUserImpression(character.impression) || null,
-      recentMessages: runtime.messages.filter((item) => item.charId === charId).length,
+      recentMessages: runtime.messages.filter((item) => item.charId === charId && isChatRuntimeMessage(item)).length,
       legacySelfInsights: Array.isArray(character.selfInsights) ? character.selfInsights : [],
       selfRoomPlateEntries: Array.isArray(selfRoomPlate?.entries) ? selfRoomPlate.entries : [],
     });
@@ -4898,7 +6327,7 @@ async function handleApi(req, res, pathname) {
       name: clean(body.userName || character.userProfile?.name || character.userName || settings.userName || "用户"),
       bio: clean(body.userBio || character.userProfile?.bio || character.userBio || settings.userBio || ""),
     };
-    const runtimeMessages = runtime.messages.filter((item) => item.charId === charId);
+    const runtimeMessages = runtime.messages.filter((item) => item.charId === charId && isChatRuntimeMessage(item));
     const query = runtimeMessages
       .slice(-12)
       .filter((item) => item.type !== "code_card")
@@ -4917,6 +6346,7 @@ async function handleApi(req, res, pathname) {
         limit: Math.max(1, Math.min(Number(body.recallLimit || 15), 30)),
         eventBoxMode: clean(body.eventBoxMode || settings.recallEventBoxMode || "compat"),
         eventBoxLiveLimit: Number(body.eventBoxLiveLimit || settings.recallEventBoxLiveLimit || 5),
+        persistState: true,
       });
       memoryPalaceContext = recalled.memoryPalaceContext || "";
     }
@@ -4969,11 +6399,20 @@ async function handleApi(req, res, pathname) {
     const charId = clean(url.searchParams.get("charId") || "");
     const after = Number(url.searchParams.get("after") || 0);
     const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit") || 200), 1000));
+    const requestedSurface = normalizeRuntimeSurface(url.searchParams.get("surface") || "");
+    const requestedVisibility = clean(url.searchParams.get("visibility") || "").toLowerCase();
+    const conversationId = clean(url.searchParams.get("conversationId") || "");
     const runtime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
-    const messages = runtime.messages
-      .filter((item) => (!charId || item.charId === charId) && item.id > after)
+    const scopedMessages = runtime.messages.map((item) => ({ ...item, ...effectiveRuntimeMessageScope(item) }));
+    const messages = scopedMessages
+      .filter((item) => (!charId || item.charId === charId)
+        && item.id > after
+        && (!requestedSurface || item.surface === requestedSurface)
+        && (!requestedVisibility || item.visibility === requestedVisibility)
+        && (!conversationId || item.conversationId === conversationId))
       .slice(-limit);
-    return send(req, res, 200, { ok: true, charId, messages, total: messages.length });
+    const surfaceCounts = Object.fromEntries([...RUNTIME_SURFACES].map((surface) => [surface, scopedMessages.filter((item) => (!charId || item.charId === charId) && item.surface === surface).length]));
+    return send(req, res, 200, { ok: true, charId, surface: requestedSurface || null, visibility: requestedVisibility || null, conversationId: conversationId || null, messages, total: messages.length, surfaceCounts });
   }
 
   if (pathname === "/api/runtime/status" && req.method === "GET") {
@@ -5002,6 +6441,16 @@ async function handleApi(req, res, pathname) {
     return send(req, res, 200, { ok: true, characters });
   }
 
+  if (pathname === "/api/runtime/storage" && req.method === "GET") {
+    const runtime = normalizeRuntimeState(await readJsonFile(RUNTIME_FILE, EMPTY_RUNTIME));
+    const databaseBytes = Number((await fs.stat(AUTHORITY_DB_FILE)).size || 0);
+    return send(req, res, 200, { ok: true, storage: runtimeMessageStorageMetrics(runtime.messages, databaseBytes) });
+  }
+
+  if (pathname === "/api/runtime/v2/read-status" && req.method === "GET") {
+    return send(req, res, 200, { ok: true, ...runtimeReadMode.status(), authorityMode: authorityStore.runtimeV2.authorityMode(), nativeWritesEnabled: RUNTIME_NATIVE_WRITES_ENABLED, shadow: authorityStore.runtimeV2Status() });
+  }
+
   if (pathname === "/api/runtime/messages" && req.method === "POST") {
     const body = await readBody(req);
     const incoming = Array.isArray(body) ? body : (body.messages || (body.message ? [body.message] : []));
@@ -5013,7 +6462,8 @@ async function handleApi(req, res, pathname) {
     const appended = appendRuntimeMessages(runtime, charId, incoming);
     const data = await readJsonFile(DATA_FILE, EMPTY_DATA);
     let dataChanged = false;
-    const legacyRecalls = applyLegacyRecallDirectives(data, charId, [...appended.appended, ...appended.updated]);
+    const chatChanges = [...appended.appended, ...appended.updated].filter((item) => isChatRuntimeMessage(item));
+    const legacyRecalls = applyLegacyRecallDirectives(data, charId, chatChanges);
     if (legacyRecalls.some((item) => item.ok && !item.alreadyActive)) dataChanged = true;
     let processing = { ok: true, skipped: true, reason: "auto_process_disabled", dataChanged: false };
     if (body.autoProcess !== false) {
@@ -5024,7 +6474,7 @@ async function handleApi(req, res, pathname) {
     if (anticipationChanged > 0) dataChanged = true;
 
     const completedTurn = body.turnCompleted === true
-      || appended.appended.some((item) => item.role === "assistant");
+      || appended.appended.some((item) => item.role === "assistant" && isChatRuntimeMessage(item));
     const digest = {
       enabled: Boolean(body.digestEnabled ?? settings.digestAutoEnabled),
       threshold: Math.max(1, Math.min(500, Number(body.digestThreshold || settings.digestAutoRounds || 50) || 50)),
@@ -5055,6 +6505,7 @@ async function handleApi(req, res, pathname) {
       await writeJsonFile(DATA_FILE, data);
     }
     await writeJsonFile(RUNTIME_FILE, runtime);
+    const activityState = persistActivityStateFromMessages(data, runtime, charId, incoming);
     return send(req, res, 200, {
       ok: true,
       charId,
@@ -5064,6 +6515,13 @@ async function handleApi(req, res, pathname) {
       digest,
       anticipationChanged,
       legacyRecalls,
+      activityState: {
+        changed: activityState.changed,
+        inputCount: activityState.inputCount,
+        activityCount: activityState.activityCount,
+        snapshotVersion: activityState.snapshot?.snapshotVersion || 0,
+        state: activityState.snapshot?.state || null,
+      },
     });
   }
 
@@ -5421,25 +6879,35 @@ async function handleApi(req, res, pathname) {
     const fetched = await fetchSullyExport(settings);
     const selectedData = selectSullyCharacter(fetched.data, requestBody.charId);
     const currentData = await readJsonFile(DATA_FILE, EMPTY_DATA, { allowCorruptFallback: true });
-    const mirror = requestBody.charId
-      ? { data: currentData, deletedCharacterIds: [], deleted: {} }
-      : removeDeletedSullySnapshotEntities(currentData, selectedData);
-    const data = mergeSullyIntoHub(mirror.data, selectedData);
-    const metadataSynced = syncVectorMetadata(data);
-    const vectorized = await autoVectorizePendingMemories(settings, data, { limit: settings.vectorLimit || 25, skipDedup: false });
-    await writeJsonFile(SETTINGS_FILE, settings);
-    await writeJsonFile(DATA_FILE, data);
+    const hub = requestBody.charId ? selectSullyCharacter(currentData, requestBody.charId) : currentData;
+    const sully = normalizeData(selectedData);
+    const domains = ["characters", "memories", "coreMemories", "vectors", "links", "roomPlates", "impressions", "eventBoxes", "anticipations", "digestReports"];
+    const idOf = (item, index) => clean(item?.id || item?.characterId || item?.charId || item?.memoryId || item?.worldbookId || `${index}`);
+    const preview = (source) => Object.fromEntries(domains.map((domain) => {
+      const items = Array.isArray(source?.[domain]) ? source[domain] : [];
+      return [domain, { count: items.length, hash: contentHash(items) }];
+    }));
+    const differences = Object.fromEntries(domains.map((domain) => {
+      const hubItems = Array.isArray(hub?.[domain]) ? hub[domain] : [];
+      const sullyItems = Array.isArray(sully?.[domain]) ? sully[domain] : [];
+      const hubIds = new Set(hubItems.map(idOf));
+      const sullyIds = new Set(sullyItems.map(idOf));
+      return [domain, {
+        onlyInHub: [...hubIds].filter((id) => !sullyIds.has(id)).slice(0, 200),
+        onlyInSully: [...sullyIds].filter((id) => !hubIds.has(id)).slice(0, 200),
+        sameCount: hubItems.length === sullyItems.length,
+        sameHash: contentHash(hubItems) === contentHash(sullyItems),
+      }];
+    }));
     return send(res, 200, {
       ok: true,
       sourceUrl: fetched.url,
-      merged: true,
-      mirrorSync: !requestBody.charId,
+      mode: "ephemeral-compare",
+      persisted: false,
       selectedCharId: requestBody.charId || "",
-      deletedCharacterIds: mirror.deletedCharacterIds,
-      deleted: mirror.deleted,
-      data: lightHubData(data),
-      vectorized,
-      metadataSynced,
+      hubPreview: preview(hub),
+      sullyPreview: preview(sully),
+      differences,
     });
   }
 
@@ -5485,11 +6953,20 @@ async function serveStatic(req, res, pathname) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    if (url.pathname.startsWith("/api/")) {
+    if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/v1/")) {
       return await handleApi(req, res, url.pathname);
     }
     return await serveStatic(req, res, url.pathname);
   } catch (error) {
+    if (error instanceof AuthorityError) {
+      return send(req, res, error.status || 400, {
+        ok: false,
+        code: error.code,
+        error: error.message,
+        retryable: error.status >= 500,
+        details: error.details,
+      });
+    }
     return send(res, 500, { ok: false, error: String(error?.message || error) });
   }
 });
@@ -5499,4 +6976,20 @@ server.listen(PORT, HOST, () => {
   console.log(`Memory Hub running at http://${shownHost}:${PORT}`);
   if (PUBLIC_BASE_URL) console.log(`Public URL: ${PUBLIC_BASE_URL}`);
   if (HUB_TOKEN) console.log("API auth: enabled via MEMORY_HUB_TOKEN");
+  console.log(`Runtime read mode: ${runtimeReadMode.status().effectiveMode} (configured: ${runtimeReadMode.status().configuredMode})`);
+  console.log(`V2 native writes: ${RUNTIME_NATIVE_WRITES_ENABLED ? "enabled" : "disabled"}`);
+  setTimeout(() => {
+    backfillLatestActivityStates()
+      .then((result) => console.log(`Activity state backfill: ${result.changed}/${result.characters} character snapshots updated`))
+      .catch((error) => console.error("Activity state backfill failed:", error));
+  }, 50).unref();
+  runtimeReadMode.start();
+  if (ACTION_RUNTIME_ENABLED) {
+    const timer = setInterval(() => { runActionRuntimeTick().catch((error) => console.error("Action runtime tick failed:", error)); }, ACTION_RUNTIME_INTERVAL_MS);
+    timer.unref();
+    setTimeout(() => { runActionRuntimeTick().catch((error) => console.error("Initial action runtime tick failed:", error)); }, 100).unref();
+    console.log(`Action runtime: enabled (${ACTION_RUNTIME_INTERVAL_MS} ms)`);
+  } else {
+    console.log("Action runtime: disabled");
+  }
 });

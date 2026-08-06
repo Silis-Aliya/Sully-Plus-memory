@@ -15,6 +15,7 @@ let hubProcess;
 let chatMode = "memory";
 let lastImpressionPrompt = "";
 let impressionCalls = 0;
+let lastChatMessages = [];
 
 function json(res, status, body) {
   const raw = JSON.stringify(body);
@@ -59,6 +60,12 @@ const modelServer = http.createServer(async (req, res) => {
     if (chatMode === "empty") {
       return json(res, 200, {
         choices: [{ message: { content: "[]" } }],
+      });
+    }
+    if (chatMode === "chat") {
+      lastChatMessages = body.messages || [];
+      return json(res, 200, {
+        choices: [{ message: { content: "Hub authority chat reply" } }],
       });
     }
     return json(res, 200, {
@@ -272,7 +279,7 @@ try {
   assert.equal(before.characters[0].processable, 86);
   assert.equal(before.characters[0].highWaterMark, 0);
 
-  const configuredData = JSON.parse(await fs.readFile(path.join(tempDir, "hub-data.json"), "utf8"));
+  const configuredData = (await request("/api/state?light=1")).data;
   assert.equal(configuredData.memoryPalaceConfig.lightLLM.apiKey, "test-key");
 
   const duplicate = await request("/api/runtime/messages", {
@@ -319,7 +326,7 @@ try {
 
   const recalled = await request("/api/legacy/recall", {
     method: "POST",
-    body: JSON.stringify({ charId: "silis", text: "[[RECALL: 2026/7]]" }),
+    body: JSON.stringify({ charId: "silis", month: "2026-07" }),
   });
   assert.equal(recalled.alreadyActive, true);
   assert.equal(recalled.yearMonth, "2026-07");
@@ -402,7 +409,7 @@ try {
   const afterFailure = await request("/api/runtime/status?charId=silis");
   assert.equal(afterFailure.characters[0].highWaterMark, 100);
 
-  const data = JSON.parse(await fs.readFile(path.join(tempDir, "hub-data.json"), "utf8"));
+  const data = (await request("/api/state")).data;
   assert.equal(data.memories.length, 1);
   assert.equal(data.vectors.length, 1);
   assert.equal(data.characters[0].hideBeforeMessageId, 86);
@@ -412,16 +419,135 @@ try {
   assert.equal(data.characters[0].impression.version, 3);
   assert.equal(data.impressions.filter((item) => item.charId === "silis" && item.type === "character_impression").length, 1);
 
-  const runtime = JSON.parse(await fs.readFile(path.join(tempDir, "runtime.json"), "utf8"));
-  assert.equal(runtime.messages.length, 401);
-  assert.equal(runtime.highWaterMarks.silis, 100);
-  assert.equal(runtime.pendingJobs.silis, undefined);
+  const runtimeMessages = (await request("/api/runtime/messages?charId=silis&limit=1000")).messages;
+  const runtimeStatus = (await request("/api/runtime/status?charId=silis")).characters[0];
+  const runtimeStorage = (await request("/api/runtime/storage")).storage;
+  assert.equal(runtimeMessages.length, 401);
+  assert.equal(runtimeStatus.highWaterMark, 100);
+  assert.equal(runtimeStatus.pendingJob, null);
+  assert.equal(runtimeStorage.count, 401);
+  assert.equal(runtimeStorage.level, "ok");
+  assert.equal(runtimeStorage.limits.messageTextBytes, 65536);
+
+  const activityIngest = await request("/api/runtime/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      charId: "silis",
+      messages: [
+        { sourceId: "background-vr-card", role: "assistant", type: "vr_card", content: "「彼方 · 娱乐室」\nbackground activity must not enter chat", timestamp: Date.UTC(2026, 6, 31, 12, 0, 0), surface: "chat", visibility: "user", metadata: { vrCard: true, room: "gym", activity: "玩完街机后留在娱乐室" } },
+        { sourceId: "hidden-proactive", role: "user", type: "text", content: "hidden proactive instruction must not enter chat", surface: "chat", visibility: "user", metadata: { hidden: true, proactiveHint: true } },
+      ],
+      autoProcess: false,
+      digestMode: "none",
+    }),
+  });
+  assert.equal(activityIngest.activityState.changed, true, JSON.stringify(activityIngest.activityState));
+  assert.equal(activityIngest.activityState.state.location, "《彼方》·娱乐室");
+  assert.equal(activityIngest.activityState.state.activity.name, "在《彼方》的娱乐室停留");
+  assert.equal(activityIngest.activityState.state.lastActivity.summary, "玩完街机后留在娱乐室");
+  assert.equal(activityIngest.activityState.state.vrState.enabled, true);
+  assert.equal(activityIngest.activityState.state.vrState.currentRoom, "gym");
+  const isolatedChat = await request("/api/runtime/messages?charId=silis&surface=chat&visibility=user&limit=1000");
+  const isolatedActivity = await request("/api/runtime/messages?charId=silis&surface=activity&visibility=internal&limit=1000");
+  const isolatedSystem = await request("/api/runtime/messages?charId=silis&surface=system&visibility=internal&limit=1000");
+  assert.equal(isolatedChat.messages.some((item) => item.sourceId === "background-vr-card" || item.sourceId === "hidden-proactive"), false);
+  assert.equal(isolatedActivity.messages.some((item) => item.sourceId === "background-vr-card"), true);
+  assert.equal(isolatedSystem.messages.some((item) => item.sourceId === "hidden-proactive"), true);
+
+  chatMode = "chat";
+  const chatTurnBody = {
+    commandId: "runtime-chat-turn-0001",
+    characterId: "silis",
+    actorId: "runtime-regression",
+    content: "Run one Hub-authoritative chat turn",
+    message: {
+      sourceId: "hub-user-source-1",
+      role: "user",
+      content: "Run one Hub-authoritative chat turn",
+    },
+    now: Date.UTC(2026, 6, 31, 13, 0, 0),
+    apiConfig: {
+      baseUrl: modelUrl,
+      apiKey: "test-key",
+      model: "mock-chat",
+    },
+  };
+  const compatDescriptor = await request("/api/v1/compat/sully");
+  assert.equal(compatDescriptor.authority, "memory-hub");
+  const compatPreview = await request("/api/v1/compat/sully/chat/preview", {
+    method: "POST",
+    body: JSON.stringify({ charId: "silis", message: chatTurnBody.message }),
+  });
+  assert.equal(compatPreview.request.characterId, "silis");
+  assert.equal(compatPreview.request.message.sourceId, "hub-user-source-1");
+  const compatChatTurnBody = { ...chatTurnBody, charId: chatTurnBody.characterId, characterId: undefined };
+  const chatTurn = await request("/api/v1/compat/sully/chat/turns", {
+    method: "POST",
+    body: JSON.stringify(compatChatTurnBody),
+  });
+  assert.equal(chatTurn.compatibility.source, "sullyos");
+  assert.equal(chatTurn.idempotentReplay, false);
+  assert.equal(chatTurn.assistantMessage.content, "Hub authority chat reply");
+  const vrContextMessage = lastChatMessages.find((item) => String(item.content || "").includes("background activity must not enter chat"));
+  assert.equal(vrContextMessage?.role, "assistant");
+  assert.equal(String(vrContextMessage?.content || "").includes("（你在《彼方》里的动态）"), true);
+  assert.equal(String(lastChatMessages[0]?.content || "").includes("### 关于《彼方》"), true);
+  assert.equal(lastChatMessages.some((item) => String(item.content || "").includes("hidden proactive instruction must not enter chat")), false);
+  assert.equal(lastChatMessages.some((item) => String(item.content || "").includes("《彼方》·娱乐室")), true);
+  assert.equal(lastChatMessages.some((item) => String(item.content || "").includes("在《彼方》的娱乐室停留")), true);
+  assert.equal(chatTurn.snapshot.snapshotVersion, 2);
+  assert.equal(chatTurn.snapshot.state.location, "《彼方》·娱乐室");
+  const replayedChatTurn = await request("/api/v1/compat/sully/chat/turns", {
+    method: "POST",
+    body: JSON.stringify(compatChatTurnBody),
+  });
+  assert.equal(replayedChatTurn.idempotentReplay, true);
+  assert.equal(replayedChatTurn.assistantMessage.id, chatTurn.assistantMessage.id);
+  const chatEvents = await request("/v1/events?after=0&characterId=silis&clientId=runtime-regression&limit=100");
+  assert.deepEqual(chatEvents.events.map((event) => event.type), [
+    "character.state.updated",
+    "command.accepted",
+    "message.user.created",
+    "message.assistant.created",
+    "character.snapshot.updated",
+  ]);
+  assert.equal(chatEvents.cursor.lastEventId, chatEvents.lastEventId);
+  const chatSnapshot = await request("/v1/characters/silis/snapshot");
+  assert.equal(chatSnapshot.snapshot.snapshotVersion, 2);
+  assert.equal(chatSnapshot.snapshot.state.lastActivity.summary, "玩完街机后留在娱乐室");
+  assert.equal(chatSnapshot.snapshot.recentMessages.at(-1).content, "Hub authority chat reply");
+  const messagesAfterChat = (await request("/api/runtime/messages?charId=silis&limit=1000")).messages;
+  assert.equal(messagesAfterChat.length, 405);
+  const mirroredHubMessages = await request("/api/runtime/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      charId: "silis",
+      messages: [
+        { sourceId: "hub-user-source-1", role: "user", content: "Run one Hub-authoritative chat turn" },
+        { sourceId: chatTurn.assistantMessage.sourceId, role: "assistant", content: "Hub authority chat reply" },
+      ],
+      autoProcess: false,
+      digestMode: "none",
+    }),
+  });
+  assert.equal(mirroredHubMessages.appended, 0);
+  assert.equal(mirroredHubMessages.updated, 2);
+  assert.equal((await request("/api/runtime/messages?charId=silis&limit=1000")).messages.length, 405);
+
+  const oversizedResponse = await fetch(hubUrl + "/api/runtime/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ charId: "silis", message: { sourceId: "oversized", role: "user", content: "x".repeat(65537) }, autoProcess: false }),
+  });
+  const oversizedBody = await oversizedResponse.json();
+  assert.equal(oversizedResponse.status, 413);
+  assert.equal(oversizedBody.code, "MESSAGE_TOO_LARGE");
 
   console.log(JSON.stringify({
     ok: true,
-    messages: runtime.messages.length,
+    messages: runtimeMessages.length,
     processedMessages: processed.processedMessages,
-    highWaterMark: runtime.highWaterMarks.silis,
+    highWaterMark: runtimeStatus.highWaterMark,
     memories: data.memories.length,
     vectors: data.vectors.length,
     legacyFragments: data.characters[0].memories.length,
@@ -429,7 +555,11 @@ try {
 
   if (childError) process.stderr.write(childError);
 } finally {
-  if (hubProcess && !hubProcess.killed) hubProcess.kill();
+  if (hubProcess && !hubProcess.killed) {
+    const exited = new Promise((resolve) => hubProcess.once("exit", resolve));
+    hubProcess.kill();
+    await exited;
+  }
   await new Promise((resolve) => modelServer.close(resolve));
   await fs.rm(tempDir, { recursive: true, force: true });
 }

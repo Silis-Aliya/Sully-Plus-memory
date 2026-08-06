@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sully.local/contracts/v1/event.schema.json",
+  "title": "HubEvent",
+  "type": "object",
+  "required": ["eventId", "type", "occurredAt", "protocolVersion", "payload"],
+  "properties": {
+    "eventId": { "type": "integer", "minimum": 1 },
+    "commandId": { "type": ["string", "null"] },
+    "type": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]+$" },
+    "characterId": { "type": ["string", "null"] },
+    "worldId": { "type": ["string", "null"] },
+    "entityVersion": { "type": ["integer", "null"], "minimum": 0 },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "protocolVersion": { "type": "string" },
+    "surface": { "type": "string", "enum": ["chat", "activity", "world", "state", "memory", "schedule", "system"] },
+    "visibility": { "type": "string", "enum": ["user", "internal"] },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}

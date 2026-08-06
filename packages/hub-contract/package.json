@@ -1,0 +1,11 @@
+{
+  "name": "@sully/hub-contract",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Versioned wire contract shared by Memory Hub and SullyOS clients",
+  "exports": {
+    ".": "./index.mjs",
+    "./schemas/*": "./schemas/*"
+  }
+}
