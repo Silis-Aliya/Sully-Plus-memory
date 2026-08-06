@@ -413,6 +413,32 @@ function isChatRuntimeMessage(item = {}, conversationId = "") {
   return !conversationId || scope.conversationId === conversationId;
 }
 
+function runtimeMessageTime(item = {}) {
+  const value = item.timestamp ?? item.occurredAt ?? item.createdAt ?? item.updatedAt ?? 0;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareRuntimeMessagesChronologically(left = {}, right = {}) {
+  const timeDifference = runtimeMessageTime(left) - runtimeMessageTime(right);
+  if (timeDifference) return timeDifference;
+  const leftId = Number(left.id ?? left.messageId ?? left.sourceId);
+  const rightId = Number(right.id ?? right.messageId ?? right.sourceId);
+  if (Number.isFinite(leftId) && Number.isFinite(rightId) && leftId !== rightId) return leftId - rightId;
+  return clean(left.id ?? left.messageId ?? left.sourceId).localeCompare(clean(right.id ?? right.messageId ?? right.sourceId));
+}
+
+function recentRuntimeMessages(messages = [], { charId = "", conversationId = "", limit = 100, includeVrCards = false } = {}) {
+  return messages
+    .filter((item) => (!charId || item.charId === charId)
+      && (isChatRuntimeMessage(item, conversationId) || (includeVrCards && isVrCardRuntimeMessage(item))))
+    .sort(compareRuntimeMessagesChronologically)
+    .slice(-Math.max(1, Number(limit) || 100));
+}
+
 function isVrCardRuntimeMessage(item = {}) {
   const type = clean(item.type || item.messageType).toLowerCase();
   const content = clean(item.content || item.text || item.body || "");
@@ -2144,7 +2170,7 @@ function persistActivityStateFromMessages(data, runtime, charId, messages = []) 
       user,
       world: current?.world || null,
       state: nextState,
-      recentMessages: runtime.messages.filter((item) => item.charId === charId && isChatRuntimeMessage(item)).slice(-100),
+      recentMessages: recentRuntimeMessages(runtime.messages, { charId, limit: 100 }),
     }, { expectedVersion: current?.snapshotVersion || 0 });
   });
   return { changed: true, snapshot, patch, inputCount: messages.length, activityCount: activityMessages.length };
@@ -4787,7 +4813,7 @@ async function ensureCharacterSnapshot(characterId) {
   const user = authorityStore.getEntity("userProfile", "me")?.data || character.userProfile || null;
   return authorityStore.transaction(() => {
     const event = authorityStore.appendEvent({ type: "character.snapshot.initialized", characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { source: "action-runtime" } });
-    return authorityStore.putSnapshot(characterId, { lastEventId: event.eventId, protocolVersion: PROTOCOL_VERSION, character, user, world: null, state: data.characterRuntime?.[characterId] || {}, recentMessages: runtime.messages.filter((item) => item.charId === characterId && isChatRuntimeMessage(item)).slice(-100) });
+    return authorityStore.putSnapshot(characterId, { lastEventId: event.eventId, protocolVersion: PROTOCOL_VERSION, character, user, world: null, state: data.characterRuntime?.[characterId] || {}, recentMessages: recentRuntimeMessages(runtime.messages, { charId: characterId, limit: 100 }) });
   });
 }
 
@@ -4917,7 +4943,7 @@ async function executeScheduledJob(job) {
       }]);
       await writeJsonFile(RUNTIME_FILE, runtime);
       message = appended.appended[0] || appended.updated[0] || null;
-      recentMessages = runtime.messages.filter((item) => item.charId === job.characterId && isChatRuntimeMessage(item)).slice(-100);
+      recentMessages = recentRuntimeMessages(runtime.messages, { charId: job.characterId, limit: 100 });
     }
   }
 
@@ -5285,7 +5311,7 @@ async function handleApi(req, res, pathname) {
         const assistantEvent = authorityStore.appendEvent({ commandId: command.commandId, type: "message.assistant.created", characterId, occurredAt: new Date(assistantMessage.timestamp).toISOString(), protocolVersion: command.protocolVersion, payload: { message: assistantMessage, model: config.model } });
         const previous = authorityStore.getSnapshot(characterId);
         const snapshotEvent = authorityStore.appendEvent({ commandId: command.commandId, type: "character.snapshot.updated", characterId, entityVersion: Number(previous?.snapshotVersion || 0) + 1, occurredAt: new Date().toISOString(), protocolVersion: command.protocolVersion, payload: { reason: "chat.turn.completed", assistantEventId: assistantEvent.eventId } });
-        snapshot = authorityStore.putSnapshot(characterId, { lastEventId: snapshotEvent.eventId, protocolVersion: command.protocolVersion, character, user: authorityStore.getEntity("userProfile", clean(body.userId || "me"))?.data || character.userProfile || null, world: previous?.world || null, state: previous?.state || data.characterRuntime?.[characterId] || {}, recentMessages: freshRuntime.messages.filter((item) => item.charId === characterId && isChatRuntimeMessage(item)).slice(-100) }, { expectedVersion: command.expectedVersion ?? previous?.snapshotVersion ?? 0 });
+        snapshot = authorityStore.putSnapshot(characterId, { lastEventId: snapshotEvent.eventId, protocolVersion: command.protocolVersion, character, user: authorityStore.getEntity("userProfile", clean(body.userId || "me"))?.data || character.userProfile || null, world: previous?.world || null, state: previous?.state || data.characterRuntime?.[characterId] || {}, recentMessages: recentRuntimeMessages(freshRuntime.messages, { charId: characterId, limit: 100 }) }, { expectedVersion: command.expectedVersion ?? previous?.snapshotVersion ?? 0 });
         const result = { commandId: command.commandId, userEventId: userEvent.eventId, assistantEventId: assistantEvent.eventId, snapshotEventId: snapshotEvent.eventId, assistantMessage, snapshot, context: body.includeContext ? assembled : undefined };
         authorityStore.finishCommand(command.commandId, { status: "completed", result });
         return { assistantEvent, snapshotEvent, result };
@@ -5327,7 +5353,7 @@ async function handleApi(req, res, pathname) {
       const character = (data.characters || []).find((item) => clean(item.id || item.characterId) === characterId);
       if (!character) throw new AuthorityError("NOT_FOUND", `character ${characterId} was not found`, 404);
       const user = authorityStore.getEntity("userProfile", "me")?.data || character.userProfile || null;
-      const recentMessages = runtime.messages.filter((item) => item.charId === characterId && isChatRuntimeMessage(item)).slice(-100);
+      const recentMessages = recentRuntimeMessages(runtime.messages, { charId: characterId, limit: 100 });
       snapshot = authorityStore.transaction(() => {
         const event = authorityStore.appendEvent({ type: "character.snapshot.initialized", characterId, occurredAt: new Date().toISOString(), protocolVersion: PROTOCOL_VERSION, payload: { source: "runtime" } });
         return authorityStore.putSnapshot(characterId, { lastEventId: event.eventId, protocolVersion: PROTOCOL_VERSION, character, user, world: null, state: data.characterRuntime?.[characterId] || {}, recentMessages });
@@ -5382,9 +5408,7 @@ async function handleApi(req, res, pathname) {
     };
     const historyLimit = Math.max(1, Math.min(1000, Number(body.historyLimit || character.contextLimit || 100) || 100));
     const conversationId = clean(body.conversationId || `direct:me:${characterId}`);
-    const messages = runtime.messages
-      .filter((item) => item.charId === characterId && (isChatRuntimeMessage(item, conversationId) || isVrCardRuntimeMessage(item)))
-      .slice(-historyLimit)
+    const messages = recentRuntimeMessages(runtime.messages, { charId: characterId, conversationId, limit: historyLimit, includeVrCards: true })
       .map((item) => isVrCardRuntimeMessage(item)
         ? formatSullyVrCardMessage(item, contextCharacter)
         : { role: item.role, content: item.content ?? item.text ?? "", id: item.id, timestamp: item.timestamp });
@@ -6410,6 +6434,7 @@ async function handleApi(req, res, pathname) {
         && (!requestedSurface || item.surface === requestedSurface)
         && (!requestedVisibility || item.visibility === requestedVisibility)
         && (!conversationId || item.conversationId === conversationId))
+      .sort(compareRuntimeMessagesChronologically)
       .slice(-limit);
     const surfaceCounts = Object.fromEntries([...RUNTIME_SURFACES].map((surface) => [surface, scopedMessages.filter((item) => (!charId || item.charId === charId) && item.surface === surface).length]));
     return send(req, res, 200, { ok: true, charId, surface: requestedSurface || null, visibility: requestedVisibility || null, conversationId: conversationId || null, messages, total: messages.length, surfaceCounts });

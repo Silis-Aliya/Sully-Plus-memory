@@ -543,6 +543,21 @@ try {
   assert.equal(oversizedResponse.status, 413);
   assert.equal(oversizedBody.code, "MESSAGE_TOO_LARGE");
 
+  await request("/api/runtime/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      charId: "silis",
+      messages: [
+        { sourceId: "newer-time-first", role: "user", content: "chronologically newer", timestamp: Date.UTC(2099, 7, 6, 12, 0, 0) },
+        { sourceId: "older-time-last", role: "user", content: "chronologically older", timestamp: Date.UTC(2099, 7, 5, 12, 0, 0) },
+      ],
+      autoProcess: false,
+      digestMode: "none",
+    }),
+  });
+  const chronological = (await request("/api/runtime/messages?charId=silis&surface=chat&visibility=user&limit=2")).messages;
+  assert.deepEqual(chronological.map((item) => item.content), ["chronologically older", "chronologically newer"]);
+
   console.log(JSON.stringify({
     ok: true,
     messages: runtimeMessages.length,
