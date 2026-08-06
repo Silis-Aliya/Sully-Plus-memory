@@ -52,6 +52,7 @@ import { RuntimeV2NativeCommandExecutor } from "./src/storage/runtimeV2NativeCom
 import { RuntimeV2PromotionManager } from "./src/storage/runtimeV2PromotionManager.mjs";
 import { deriveActivityStatePatch } from "./src/runtime/activityState.mjs";
 import { formatSullyVrCardMessage } from "./sullyVrContext.mjs";
+import { formatSullyMessageForModel } from "./sullyMessageContext.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -5408,10 +5409,12 @@ async function handleApi(req, res, pathname) {
     };
     const historyLimit = Math.max(1, Math.min(1000, Number(body.historyLimit || character.contextLimit || 100) || 100));
     const conversationId = clean(body.conversationId || `direct:me:${characterId}`);
+    const messageTimeZone = contextCharacter.customTimezoneEnabled && contextCharacter.customTimezone ? contextCharacter.customTimezone : "";
     const messages = recentRuntimeMessages(runtime.messages, { charId: characterId, conversationId, limit: historyLimit, includeVrCards: true })
       .map((item) => isVrCardRuntimeMessage(item)
         ? formatSullyVrCardMessage(item, contextCharacter)
-        : { role: item.role, content: item.content ?? item.text ?? "", id: item.id, timestamp: item.timestamp });
+        : formatSullyMessageForModel(item, { timeZone: messageTimeZone }))
+      .map((item) => ({ role: item.role, content: item.content ?? item.text ?? "", id: item.id, timestamp: item.timestamp }));
     const query = clean(body.query || messages.slice(-12).map((item) => clean(item.content)).filter(Boolean).join("\n"));
     let recalled = { items: [], memoryPalaceContext: "", roomPlatesContext: "" };
     if (character.memoryPalaceEnabled && query) {

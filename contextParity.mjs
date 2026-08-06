@@ -1,5 +1,6 @@
 import { normalizeUserImpression } from "./sullyImpression.mjs";
 import { buildSullyChatPromptParts } from "./sullyChatPrompt.mjs";
+import { formatSullyMessagesForModel } from "./sullyMessageContext.mjs";
 import { buildSullyVrStableContext } from "./sullyVrContext.mjs";
 
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -155,7 +156,10 @@ export function buildCoreContext({ character: char = {}, userProfile: user = {},
 }
 
 export function buildContextParity(input = {}) {
-  const core = buildCoreContext(input), char = input.character || {};
+  const char = input.character || {};
+  const timeZone = char.customTimezoneEnabled && char.customTimezone ? char.customTimezone : "";
+  const contextMessages = formatSullyMessagesForModel(input.messages || [], { timeZone });
+  const core = buildCoreContext({ ...input, messages: contextMessages });
   let volatile = `\n[System: 实时状态 (Live Context)]\n（以下是此刻的实时状态——当前时间、你正在做的事、你的情绪底色、周边动态。你的人设与聊天规则见最上方的系统设定，此处不再重复。）\n\n`;
   volatile += buildTimeAwarenessBlock(char, { now: input.now, lastInteractionTs: input.lastInteractionTs });
   if (char.memoryPalaceEnabled && String(input.memoryPalaceContext || "").trim()) volatile += `${input.memoryPalaceContext}\n\n`;
@@ -163,7 +167,7 @@ export function buildContextParity(input = {}) {
   if (input.runtimeStateContext) volatile += input.runtimeStateContext;
   if (input.recencyTail) volatile += input.recencyTail;
   if (core.chatPrompt?.recencyTail) volatile += core.chatPrompt.recencyTail;
-  const history = injectWorldbookDepthEntries(input.messages || [], core.depthEntries);
+  const history = injectWorldbookDepthEntries(contextMessages, core.depthEntries);
   return {
     stableSystemPrompt: core.context,
     volatileContext: volatile,

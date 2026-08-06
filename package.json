@@ -24,6 +24,7 @@
     "test:authority": "node scripts/authority-regression.mjs",
     "test:authority-api": "node scripts/authority-api-regression.mjs",
     "test:context-parity": "node scripts/context-parity-regression.mjs",
+    "test:message-context": "node scripts/message-context-regression.mjs",
     "audit:sully-context": "node scripts/sully-context-coverage-audit.mjs",
     "test:sully-compat": "node scripts/sully-compat-regression.mjs",
     "test:hub-ui": "node scripts/hub-ui-regression.mjs",
