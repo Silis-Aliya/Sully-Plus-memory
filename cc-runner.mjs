@@ -1,7 +1,8 @@
-import { mkdir, writeFile, chmod } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, writeFile, chmod } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ClaudeCodeRuntime, assembleWakeInput } from "./src/cc/claudeCodeRuntime.mjs";
+import { ClaudeCodeRuntime, assembleWakeInput, buildCharacterClaudeMd } from "./src/cc/claudeCodeRuntime.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const hubUrl = String(process.env.MEMORY_HUB_URL || "http://127.0.0.1:8787").replace(/\/+$/, "");
@@ -15,7 +16,7 @@ const commandArgsPrefix = String(process.env.CC_RUNNER_CLAUDE_PREFIX_ARGS || "")
 const model = String(process.env.CC_RUNNER_CLAUDE_MODEL || "");
 const permissionMode = String(process.env.CC_RUNNER_PERMISSION_MODE || "default");
 const extraArgs = String(process.env.CC_RUNNER_CLAUDE_ARGS || "").split("\n").map((value) => value.trim()).filter(Boolean);
-const workspace = path.resolve(process.env.CC_RUNNER_WORKSPACE || root);
+const workspaceBase = path.resolve(process.env.CC_RUNNER_WORKSPACE || path.join(root, ".memory-hub", "cc-characters"));
 const stateDir = path.resolve(process.env.CC_RUNNER_STATE_DIR || path.join(root, ".memory-hub", "cc-runner"));
 const runtimes = new Map();
 const once = /^(?:1|true|yes)$/i.test(String(process.env.CC_RUNNER_ONCE || ""));
@@ -39,19 +40,51 @@ async function ensureMcpConfig() {
   return file;
 }
 
-async function runtimeFor(id, sessionId, mcpConfig) {
-  let runtime = runtimes.get(id);
-  if (runtime && !runtime.isAlive) {
-    runtime.close();
+function characterDirectoryName(characterId) {
+  const normalized = String(characterId || "").normalize("NFKC");
+  const readable = normalized.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "").slice(0, 64) || "character";
+  const suffix = createHash("sha256").update(normalized).digest("hex").slice(0, 12);
+  return `${readable}-${suffix}`;
+}
+
+async function ensureCharacterWorkspace(characterId, context) {
+  const characterRoot = path.join(workspaceBase, characterDirectoryName(characterId));
+  const workDir = path.join(characterRoot, "workspace");
+  const claudeMdPath = path.join(characterRoot, "CLAUDE.md");
+  await mkdir(workDir, { recursive: true });
+  const stableContext = typeof context?.stableContext === "string" ? context.stableContext.trim() : "";
+  let current = "";
+  try { current = await readFile(claudeMdPath, "utf8"); } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (!stableContext && !current) throw new Error(`Hub did not provide stable context for new character workspace ${characterId}`);
+  if (stableContext) {
+    const next = buildCharacterClaudeMd(stableContext);
+    if (current !== next) {
+      await writeFile(claudeMdPath, next, { encoding: "utf8", mode: 0o600 });
+      try { await chmod(claudeMdPath, 0o600); } catch {}
+      current = next;
+    }
+  }
+  return { characterRoot, workDir, claudeMdPath, stableContextHash: String(context?.stableContextHash || createHash("sha256").update(current).digest("hex")), stableContextVersion: Number(context?.stableContextVersion || 0) };
+}
+
+async function runtimeFor(id, sessionId, mcpConfig, context) {
+  const workspace = await ensureCharacterWorkspace(id, context);
+  let entry = runtimes.get(id);
+  const stableChanged = entry && (entry.stableContextHash !== workspace.stableContextHash || entry.stableContextVersion !== workspace.stableContextVersion);
+  if (entry && (!entry.runtime.isAlive || stableChanged)) {
+    entry.runtime.close();
     runtimes.delete(id);
-    runtime = null;
+    entry = null;
   }
-  if (!runtime) {
-    runtime = new ClaudeCodeRuntime({ command, commandArgsPrefix, cwd: workspace, env: process.env, model, permissionMode, extraArgs, mcpConfig, turnTimeoutMs: Math.max(60_000, leaseMs - 15_000) });
+  if (!entry) {
+    const runtime = new ClaudeCodeRuntime({ command, commandArgsPrefix, cwd: workspace.workDir, env: process.env, model, permissionMode, extraArgs, mcpConfig, turnTimeoutMs: Math.max(60_000, leaseMs - 15_000) });
     await runtime.connect(sessionId);
-    runtimes.set(id, runtime);
+    entry = { runtime, ...workspace };
+    runtimes.set(id, entry);
   }
-  return runtime;
+  return entry.runtime;
 }
 
 async function failWake(wakeRun, error) {
@@ -62,15 +95,15 @@ async function failWake(wakeRun, error) {
 
 async function processWake(wakeRun, context, mcpConfig) {
   try {
-    const runtime = await runtimeFor(wakeRun.characterId, context.sessionId || wakeRun.sessionId || "", mcpConfig);
+    const runtime = await runtimeFor(wakeRun.characterId, context.sessionId || wakeRun.sessionId || "", mcpConfig, context);
     const result = await runtime.turn(assembleWakeInput(context));
     if (!result.text) throw new Error("Claude Code completed without an activity result");
     const commandId = `cc-wake:${wakeRun.wakeRunId}:commit`;
     await hub("/api/v1/runtime/commands", { method: "POST", body: { commandId, idempotencyKey: commandId, protocolVersion: "1.0", type: "runtime.activity.commit", characterId: wakeRun.characterId, payload: { activity: { activityId: `cc-activity:${wakeRun.wakeRunId}`, content: result.text, occurredAt: new Date().toISOString(), visibility: "internal" }, wakeRunId: wakeRun.wakeRunId, leaseToken: wakeRun.leaseToken, sessionId: result.sessionId || context.sessionId || null, deliveryTargets: Array.isArray(context.deliveryTargets) ? context.deliveryTargets : [] } } });
     process.stdout.write(`[cc-runner] completed wake=${wakeRun.wakeRunId} character=${wakeRun.characterId} session=${result.sessionId || "unknown"}\n`);
   } catch (error) {
-    const runtime = runtimes.get(wakeRun.characterId);
-    runtime?.close();
+    const entry = runtimes.get(wakeRun.characterId);
+    entry?.runtime.close();
     runtimes.delete(wakeRun.characterId);
     await failWake(wakeRun, error);
   }
@@ -81,7 +114,7 @@ async function main() {
   process.stdout.write(`[cc-runner] ready hub=${hubUrl} character=${characterId || "*"}\n`);
   while (!stopping) {
     try {
-      const claimed = await hub("/api/v1/cc/wakes/claim", { method: "POST", body: { characterId, leaseMs } });
+      const claimed = await hub("/api/v1/cc/wakes/claim", { method: "POST", body: { characterId, leaseMs, forceStable: true } });
       if (claimed.wakeRun) await processWake(claimed.wakeRun, claimed.context, mcpConfig);
       if (once) break;
       else await new Promise((resolve) => setTimeout(resolve, pollMs));
@@ -90,7 +123,7 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
   }
-  for (const runtime of runtimes.values()) runtime.close();
+  for (const entry of runtimes.values()) entry.runtime.close();
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { stopping = true; });

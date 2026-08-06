@@ -226,7 +226,7 @@ Hub 端已实现：
 
 VPS 尚未实际部署。部署时不上传 `.audit-backups`、recovery、`.env` 或本地日志；需要上传代码、单独制作的一致性 `authority.sqlite` 快照，并为 Hub 与 CC Runner 配置进程守护。CC Runner 应使用 VPS 上 Claude Code 的绝对可执行路径。
 
-CC Runner 为每个角色保存 `lastSeenMessageId`、`sessionId`、`stableContextVersion` 和 `lastWakeAt`。首次会话、重启、compact 或稳定上下文版本变化时发送完整稳定人格层；普通唤醒只发送新增原始聊天、状态变化、相关记忆和未完成任务，避免每次重复发送数万 Token 的完整上下文。
+CC Runner 为每个角色保存 `lastSeenMessageId`、`sessionId`、`stableContextVersion` 和 `lastWakeAt`。Runner 在 `CC_RUNNER_WORKSPACE` 下为每个角色建立独立的 `<character>-<hash>/CLAUDE.md` 与 `workspace/`，不会复用日常 Claude Code 项目的人设或工作目录。首次会话、Runner 重启或稳定上下文版本变化时，Hub 用 SullyOS 权威稳定上下文生成/更新该角色的 `CLAUDE.md`；普通唤醒只向现有会话发送新增原始聊天、状态变化、相关记忆和未完成任务，避免每次重复发送数万 Token 的完整上下文。当前尚未实现对 Claude Code 内部 compact 事件的可靠自动检测，compact 恢复仍需在 VPS 冒烟测试后补齐。
 
 MCP Server 使用 `MEMORY_HUB_URL` 与 `MEMORY_HUB_TOKEN` 通过 HTTP 调用 Hub，当前提供：
 

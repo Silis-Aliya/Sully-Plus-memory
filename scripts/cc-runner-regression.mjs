@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const stateDir = await mkdtemp(path.join(os.tmpdir(), "sully-cc-runner-"));
+const workspaceDir = path.join(stateDir, "characters");
 const requests = [];
 let claimed = false;
 const server = createServer(async (req, res) => {
@@ -27,20 +29,28 @@ const server = createServer(async (req, res) => {
 });
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
-const child = spawn(process.execPath, [path.join(root, "cc-runner.mjs")], { cwd: root, env: { ...process.env, MEMORY_HUB_URL: `http://127.0.0.1:${port}`, MEMORY_HUB_TOKEN: "runner-token", CC_RUNNER_ONCE: "true", CC_RUNNER_STATE_DIR: stateDir, CC_RUNNER_CLAUDE_COMMAND: process.execPath, CC_RUNNER_CLAUDE_PREFIX_ARGS: path.join(root, "scripts", "fixtures", "fake-claude-stream.mjs") }, stdio: ["ignore", "pipe", "pipe"] });
+const child = spawn(process.execPath, [path.join(root, "cc-runner.mjs")], { cwd: root, env: { ...process.env, MEMORY_HUB_URL: `http://127.0.0.1:${port}`, MEMORY_HUB_TOKEN: "runner-token", CC_RUNNER_ONCE: "true", CC_RUNNER_STATE_DIR: stateDir, CC_RUNNER_WORKSPACE: workspaceDir, CC_RUNNER_CLAUDE_COMMAND: process.execPath, CC_RUNNER_CLAUDE_PREFIX_ARGS: path.join(root, "scripts", "fixtures", "fake-claude-stream.mjs") }, stdio: ["ignore", "pipe", "pipe"] });
 let stdout = "", stderr = "";
 child.stdout.on("data", (chunk) => { stdout += chunk; });
 child.stderr.on("data", (chunk) => { stderr += chunk; });
 const code = await new Promise((resolve) => child.once("close", resolve));
 server.close();
-await rm(stateDir, { recursive: true, force: true });
 assert.equal(code, 0, stderr);
 assert.equal(requests.every((item) => item.token === "Bearer runner-token"), true);
+const claim = requests.find((item) => item.url === "/api/v1/cc/wakes/claim")?.body;
+assert.equal(claim.forceStable, true);
 const commit = requests.find((item) => item.url === "/api/v1/runtime/commands")?.body;
 assert.equal(commit.commandId, "cc-wake:wake-runner-1:commit");
-assert.equal(commit.payload.activity.content, "verbatim:stable");
+assert.equal(commit.payload.activity.content, "verbatim:delta");
 assert.equal(commit.payload.activity.visibility, "internal");
 assert.equal(commit.payload.sessionId, "11111111-2222-4333-8444-555555555555");
 assert.equal(commit.payload.wakeRunId, "wake-runner-1");
 assert.deepEqual(commit.payload.deliveryTargets, ["phone-runner"]);
+const characterDirectories = await readdir(workspaceDir);
+assert.equal(characterDirectories.length, 1);
+const claudeMd = await readFile(path.join(workspaceDir, characterDirectories[0], "CLAUDE.md"), "utf8");
+assert.match(claudeMd, /你是由 Memory Hub 托管的持续角色运行实例/);
+assert.match(claudeMd, /【权威角色上下文开始】\n\nEXACT_STABLE\n\n【权威角色上下文结束】/);
+assert.equal(createHash("sha256").update(claudeMd).digest("hex"), "19d2f38d1c530c91c0400d71a016e57eb3638a3d655a312d2fb1647c5621f9a2");
+await rm(stateDir, { recursive: true, force: true });
 console.log(JSON.stringify({ ok: true, claims: 1, commits: 1, stdout: stdout.trim() }));

@@ -39,10 +39,13 @@ Important variables:
 - `MEMORY_HUB_RUNTIME_NATIVE_WRITES_ENABLED=true`（only after V2 promotion）
 - `MEMORY_HUB_URL=http://127.0.0.1:8787`
 - `CC_RUNNER_CLAUDE_COMMAND=/absolute/path/to/claude`
+- `CC_RUNNER_WORKSPACE=/var/lib/sully-memory-hub/cc-characters`
 
 Use a long random token for `MEMORY_HUB_TOKEN`. The dashboard sends it as `X-Memory-Hub-Token`.
 
 Do not upload a local `.env`, `.audit-backups`, recovery directories, logs, or `node_modules`. Transfer the code and a separately created, consistent `authority.sqlite` snapshot. Keep the original database and recovery material until the VPS copy has passed parity and smoke tests.
+
+`CC_RUNNER_WORKSPACE` is a base directory, not a shared role workspace. The runner creates one isolated directory per character containing a generated `CLAUDE.md` and a separate `workspace/`. The generated file combines the approved CC runtime rules with Hub's authoritative SullyOS stable context. Do not place a second manually maintained character persona in that directory.
 
 ## Start Locally On VPS
 
